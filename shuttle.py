@@ -82,24 +82,28 @@ def is_unrealistic_movement(prev_pos, curr_pos, threshold=TELEPORT_THRESHOLD):
         return abs(curr_pos[0] - prev_pos[0]) > threshold
     return False
 
+def load_processed_frames(processed_csv_file):
+    """Load processed frames from the CSV file."""
+    with open(processed_csv_file, 'r') as csvfile:
+        reader = csv.DictReader(csvfile)
+        processed_frames = {int(row['frame']): int(row['is_rally_scene'] == 'True') for row in reader}
+    return processed_frames
+
 parser = argparse.ArgumentParser()
-parser.add_argument('--video_file', type=str)
-parser.add_argument('--model_file', type=str, default='resources/model_best.pt')
-parser.add_argument('--num_frame', type=int, default=3)
-parser.add_argument('--batch_size', type=int, default=8)
-parser.add_argument('--save_dir', type=str, default='result')
+parser.add_argument('video_file', type=str, help='Path to the video file')
 args = parser.parse_args()
 
 video_file = args.video_file
-model_file = args.model_file
-num_frame = args.num_frame
-batch_size = args.batch_size
-save_dir = args.save_dir
+model_file = 'resources/model_best.pt'
+num_frame = 3
+batch_size = 8
+save_dir = 'result'
 
 video_name = video_file.split('/')[-1][:-4]
 video_format = video_file.split('/')[-1][-3:]
-out_video_file = f'{save_dir}/{video_name}_pred.{video_format}'
-out_csv_file = f'{save_dir}/{video_name}_ball.csv'
+out_video_file = f'{save_dir}/{video_name}_shuttle.{video_format}'
+out_csv_file = f'{save_dir}/{video_name}_shuttle.csv'
+processed_csv_file = f'{save_dir}/{video_name}_processed.csv'
 
 device = get_device()
 
@@ -123,6 +127,8 @@ elif video_format == 'mp4':
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
 else:
     raise ValueError('Invalid video format.')
+
+processed_frames = load_processed_frames(processed_csv_file)
 
 with open(out_csv_file, 'w', newline='') as csvfile:
     fieldnames = ['Frame', 'Visibility', 'X', 'Y']
@@ -191,17 +197,19 @@ with open(out_csv_file, 'w', newline='') as csvfile:
                         break
 
                     img = frame_queue[i].copy()
-                    cx_pred, cy_pred = get_object_center(h_pred[i])
-                    cx_pred, cy_pred = int(ratio * cx_pred), int(ratio * cy_pred)
+                    frame_index = frame_count - (num_frame * batch_size) + i
+                    if frame_index in processed_frames and processed_frames[frame_index] == 1:
+                        cx_pred, cy_pred = get_object_center(h_pred[i])
+                        cx_pred, cy_pred = int(ratio * cx_pred), int(ratio * cy_pred)
 
-                    if len(positions) > 0 and is_unrealistic_movement(positions[-1], (cx_pred, cy_pred)):
-                        cx_pred, cy_pred = 0, 0  # Mark as invalid if unrealistic movement is detected
+                        if len(positions) > 0 and is_unrealistic_movement(positions[-1], (cx_pred, cy_pred)):
+                            cx_pred, cy_pred = 0, 0  # Mark as invalid if unrealistic movement is detected
 
-                    vis = 1 if cx_pred > 0 and cy_pred > 0 else 0
-                    positions.append((cx_pred, cy_pred))
-                    writer.writerow({'Frame': frame_count - (num_frame * batch_size) + i, 'Visibility': vis, 'X': cx_pred, 'Y': cy_pred})
-                    if cx_pred != 0 or cy_pred != 0:
-                        cv2.circle(img, (cx_pred, cy_pred), 5, (0, 0, 255), -1)
+                        vis = 1 if cx_pred > 0 and cy_pred > 0 else 0
+                        positions.append((cx_pred, cy_pred))
+                        writer.writerow({'Frame': frame_index, 'Visibility': vis, 'X': cx_pred, 'Y': cy_pred})
+                        if cx_pred != 0 or cy_pred != 0:
+                            cv2.circle(img, (cx_pred, cy_pred), 5, (0, 0, 255), -1)
                     out.write(img)
 
 out.release()
