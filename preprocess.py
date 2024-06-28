@@ -135,7 +135,7 @@ def process_video(video_path):
     cap.release()
     out.release()
 
-    with open(os.path.join(result_dir, f"{base_name}_processed.csv"), 'w', newline='') as csvfile:
+    with open(os.path.join(result_dir, f"{base_name}_preprocessed.csv"), 'w', newline='') as csvfile:
         csv.writer(csvfile).writerow(["frame", "is_rally_scene"])
         csv.writer(csvfile).writerows(enumerate(smoothed_results))
 
