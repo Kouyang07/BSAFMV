@@ -6,13 +6,13 @@ import subprocess
 import argparse
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import multiprocessing
 
 def read_court_coordinates(file_path):
     with open(file_path, 'r') as file:
         return [tuple(map(float, line.strip().split(';'))) for line in file.readlines()[:4]]
 
-def get_area_hsv_values(frame, court_corners, area_width=5):
-    hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+def get_area_hsv_values(hsv_frame, court_corners, area_width=5):
     hsv_values = []
 
     def sample_area_hsv(p1, p2, area_width):
@@ -39,9 +39,7 @@ def determine_hsv_thresholds(hsv_values):
     upper_bound[upper_bound > 255] = 255
     return lower_bound.astype(int), upper_bound.astype(int)
 
-def check_court_presence(frame, court_corners, lower_hsv, upper_hsv, area_width=5):
-    hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-
+def check_court_presence(hsv_frame, court_corners, lower_hsv, upper_hsv, area_width=5):
     def is_area_within_range(p1, p2, area_width):
         num_samples = int(np.hypot(p2[0] - p1[0], p2[1] - p1[1]))
         x_values = np.linspace(p1[0], p2[0], num_samples).astype(int)
@@ -63,18 +61,27 @@ def check_court_presence(frame, court_corners, lower_hsv, upper_hsv, area_width=
     return True
 
 def smooth_decisions(decisions, window_size, fps):
-    smoothed_decisions = [sum(decisions[max(0, i - window_size // 2):min(len(decisions), i + window_size // 2 + 1)]) / (min(len(decisions), i + window_size // 2 + 1) - max(0, i - window_size // 2)) > 0.5 for i in range(len(decisions))]
+    decisions = np.array(decisions, dtype=np.float32)
+    kernel = np.ones(window_size) / window_size
+    smoothed_decisions = np.convolve(decisions, kernel, mode='same')
+    smoothed_decisions = smoothed_decisions > 0.5
+
     min_frames = int(3 * fps)
-    filtered_decisions, current_duration = smoothed_decisions[:], 0
+    filtered_decisions = np.copy(smoothed_decisions)
+    current_duration = 0
+
     for i, decision in enumerate(smoothed_decisions):
-        if decision: current_duration += 1
+        if decision:
+            current_duration += 1
         else:
             if 0 < current_duration < min_frames:
-                filtered_decisions[i - current_duration:i] = [False] * current_duration
+                filtered_decisions[i - current_duration:i] = False
             current_duration = 0
+
     if 0 < current_duration < min_frames:
-        filtered_decisions[-current_duration:] = [False] * current_duration
-    return filtered_decisions
+        filtered_decisions[-current_duration:] = False
+
+    return filtered_decisions.tolist()
 
 def run_detect_script(video_path, output_path):
     print("Running detect script.")
@@ -86,7 +93,8 @@ def run_detect_script(video_path, output_path):
     raise ValueError("Failed to extract frame index from detect script output.")
 
 def process_frame(frame_index, frame, court_corners, lower_hsv, upper_hsv, area_width=5):
-    return frame_index, check_court_presence(frame, court_corners, lower_hsv, upper_hsv, area_width)
+    hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    return frame_index, check_court_presence(hsv_frame, court_corners, lower_hsv, upper_hsv, area_width)
 
 def process_video(video_path):
     base_name, result_dir = os.path.splitext(os.path.basename(video_path))[0], "result/"
@@ -104,11 +112,11 @@ def process_video(video_path):
         return
 
     court_corners = read_court_coordinates(coordinates_file)
-    hsv_values = get_area_hsv_values(frame, court_corners)
+    hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    hsv_values = get_area_hsv_values(hsv_frame, court_corners)
     lower_hsv, upper_hsv = determine_hsv_thresholds(hsv_values)
 
     cap, frame_results = cv2.VideoCapture(video_path), []
-
     if not cap.isOpened():
         print("Error: Could not open video.")
         return
@@ -117,7 +125,8 @@ def process_video(video_path):
     out = cv2.VideoWriter(os.path.join(result_dir, f"{base_name}_processed.mp4"), fourcc, fps, (width, height))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    with ThreadPoolExecutor() as executor:
+    num_workers = multiprocessing.cpu_count()
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
         futures = [executor.submit(process_frame, frame_index, frame, court_corners, lower_hsv, upper_hsv) for frame_index, frame in enumerate((cap.read()[1] for _ in tqdm(range(total_frames), desc="Reading frames")))]
         frame_results = [future.result() for future in tqdm(as_completed(futures), total=total_frames, desc="Processing frames")]
 

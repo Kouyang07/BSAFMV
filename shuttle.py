@@ -103,7 +103,7 @@ video_name = video_file.split('/')[-1][:-4]
 video_format = video_file.split('/')[-1][-3:]
 out_video_file = f'{save_dir}/{video_name}_shuttle.{video_format}'
 out_csv_file = f'{save_dir}/{video_name}_shuttle.csv'
-processed_csv_file = f'{save_dir}/{video_name}_processed.csv'
+preprocessed_csv_file = f'{save_dir}/{video_name}_preprocessed.csv'
 
 device = get_device()
 
@@ -128,7 +128,7 @@ elif video_format == 'mp4':
 else:
     raise ValueError('Invalid video format.')
 
-processed_frames = load_processed_frames(processed_csv_file)
+processed_frames = load_processed_frames(preprocessed_csv_file)
 
 with open(out_csv_file, 'w', newline='') as csvfile:
     fieldnames = ['Frame', 'Visibility', 'X', 'Y']
