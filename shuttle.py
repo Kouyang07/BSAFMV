@@ -1,216 +1,168 @@
 import os
-import cv2
+import csv
+from typing import List, Tuple, Dict
 import argparse
+import cv2
 import numpy as np
 import torch
 from tqdm import tqdm
-import csv
 
 HEIGHT = 288
 WIDTH = 512
-TELEPORT_THRESHOLD = 50  # Adjust this value based on the expected max shuttle speed between frames
-MAX_INTERPOLATE_FRAMES = 15  # Maximum number of frames to interpolate
+TELEPORT_THRESHOLD = 50
+MAX_INTERPOLATE_FRAMES = 15
 
-def get_model(model_name, num_frame, input_type):
+def get_model(model_name: str, num_frame: int, input_type: str) -> torch.nn.Module:
     """Create model by name and configuration parameter."""
     if model_name == 'TrackNetV2':
         from resources.model import TrackNetV2 as TrackNet
+        return TrackNet(in_dim=num_frame*3, out_dim=num_frame)
+    raise ValueError(f"Unsupported model: {model_name}")
 
-    if model_name in ['TrackNetV2']:
-        model = TrackNet(in_dim=num_frame*3, out_dim=num_frame)
-
-    return model
-
-def get_frame_unit(frame_list, num_frame, device):
+def get_frame_unit(frame_list: List[np.ndarray], num_frame: int, device: torch.device) -> torch.Tensor:
     """Sample frames from the video."""
+    def get_unit(frames: List[np.ndarray]) -> np.ndarray:
+        return np.concatenate([cv2.resize(img, (WIDTH, HEIGHT))[np.newaxis, ...] for img in frames], axis=0)
+
     batch = []
-    h, w, _ = frame_list[0].shape
-    h_ratio = h / HEIGHT
-    w_ratio = w / WIDTH
-
-    def get_unit(frame_list):
-        """Generate an input sequence from frames."""
-        frames = np.array([]).reshape(0, HEIGHT, WIDTH, 3)
-
-        for img in frame_list:
-            img = cv2.resize(img, (WIDTH, HEIGHT))
-            frames = np.concatenate((frames, img[np.newaxis, ...]), axis=0)
-
-        return frames
-
     for i in range(0, len(frame_list), num_frame):
         frames = get_unit(frame_list[i: i+num_frame])
-        frames = frames.transpose((0, 3, 1, 2))  # Change shape to (F, 3, H, W)
-        frames = frames.reshape(-1, HEIGHT, WIDTH)
-        frames = frames / 255.0
+        frames = frames.transpose((0, 3, 1, 2)).reshape(-1, HEIGHT, WIDTH) / 255.0
         batch.append(frames)
 
-    batch = np.array(batch)
-    return torch.FloatTensor(batch).to(device)
+    return torch.FloatTensor(np.array(batch)).to(device)
 
-def get_object_center(heatmap):
+def get_object_center(heatmap: np.ndarray) -> Tuple[int, int]:
     """Get coordinates from the heatmap."""
     if np.amax(heatmap) == 0:
         return 0, 0
-    else:
-        (cnts, _) = cv2.findContours(heatmap.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        rects = [cv2.boundingRect(ctr) for ctr in cnts]
 
-        max_area_idx = 0
-        max_area = rects[max_area_idx][2] * rects[max_area_idx][3]
-        for i in range(len(rects)):
-            area = rects[i][2] * rects[i][3]
-            if area > max_area:
-                max_area_idx = i
-                max_area = area
-        target = rects[max_area_idx]
+    (cnts, _) = cv2.findContours(heatmap.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    rects = [cv2.boundingRect(ctr) for ctr in cnts]
 
-    return int((target[0] + target[2] / 2)), int((target[1] + target[3] / 2))
+    max_area_idx = max(range(len(rects)), key=lambda i: rects[i][2] * rects[i][3])
+    target = rects[max_area_idx]
 
-def get_device():
+    return int(target[0] + target[2] / 2), int(target[1] + target[3] / 2)
+
+def get_device() -> torch.device:
     """Returns the best available device (CUDA if available, otherwise MPS, then CPU)."""
     if torch.cuda.is_available():
         return torch.device('cuda')
-    elif torch.backends.mps.is_available():
+    if torch.backends.mps.is_available():
         return torch.device('mps')
-    else:
-        return torch.device('cpu')
+    return torch.device('cpu')
 
-def is_unrealistic_movement(prev_pos, curr_pos, threshold=TELEPORT_THRESHOLD):
+def is_unrealistic_movement(prev_pos: Tuple[int, int], curr_pos: Tuple[int, int], threshold: int = TELEPORT_THRESHOLD) -> bool:
     """Check for unrealistic horizontal shuttle movement."""
-    if prev_pos[0] > 0 and curr_pos[0] > 0:
-        return abs(curr_pos[0] - prev_pos[0]) > threshold
-    return False
+    return prev_pos[0] > 0 and curr_pos[0] > 0 and abs(curr_pos[0] - prev_pos[0]) > threshold
 
-def load_processed_frames(processed_csv_file):
-    """Load processed frames from the CSV file."""
-    with open(processed_csv_file, 'r') as csvfile:
-        reader = csv.DictReader(csvfile)
-        processed_frames = {int(row['frame']): int(row['is_rally_scene'] == 'True') for row in reader}
-    return processed_frames
+def get_direction(prev_pos: Tuple[int, int], curr_pos: Tuple[int, int]) -> int:
+    """Determine the direction of the shuttle movement."""
+    if prev_pos[1] == 0 or curr_pos[1] == 0:
+        return 1  # Default to downward if we don't have enough information
+    return 1 if curr_pos[1] > prev_pos[1] else 0
 
-parser = argparse.ArgumentParser()
-parser.add_argument('video_file', type=str, help='Path to the video file')
-args = parser.parse_args()
+def process_video(video_file: str, model_file: str, save_dir: str):
+    """Main function to process the video and track the shuttle."""
+    video_name = os.path.splitext(os.path.basename(video_file))[0]
+    video_format = os.path.splitext(video_file)[1][1:]
+    out_video_file = f'{save_dir}/{video_name}_shuttle.{video_format}'
+    out_csv_file = f'{save_dir}/{video_name}_shuttle.csv'
 
-video_file = args.video_file
-model_file = 'resources/model_best.pt'
-num_frame = 3
-batch_size = 8
-save_dir = 'result'
+    device = get_device()
+    print(f'Using device: {device}')
 
-video_name = video_file.split('/')[-1][:-4]
-video_format = video_file.split('/')[-1][-3:]
-out_video_file = f'{save_dir}/{video_name}_shuttle.{video_format}'
-out_csv_file = f'{save_dir}/{video_name}_shuttle.csv'
-preprocessed_csv_file = f'{save_dir}/{video_name}_preprocessed.csv'
+    checkpoint = torch.load(model_file, map_location=device)
+    param_dict = checkpoint['param_dict']
+    model_name = param_dict['model_name']
+    num_frame = param_dict['num_frame']
+    input_type = param_dict['input_type']
+    batch_size = 8
 
-device = get_device()
+    os.makedirs(save_dir, exist_ok=True)
 
-checkpoint = torch.load(model_file, map_location=torch.device(device))
-print('Using device:', device)
-param_dict = checkpoint['param_dict']
-model_name = param_dict['model_name']
-num_frame = param_dict['num_frame']
-input_type = param_dict['input_type']
+    model = get_model(model_name, num_frame, input_type).to(device)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    model.eval()
 
-if not os.path.exists(save_dir):
-    os.makedirs(save_dir)
-
-model = get_model(model_name, num_frame, input_type).to(device)
-model.load_state_dict(checkpoint['model_state_dict'])
-model.eval()
-
-if video_format == 'avi':
-    fourcc = cv2.VideoWriter_fourcc(*'DIVX')
-elif video_format == 'mp4':
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-else:
-    raise ValueError('Invalid video format.')
-
-processed_frames = load_processed_frames(preprocessed_csv_file)
-
-with open(out_csv_file, 'w', newline='') as csvfile:
-    fieldnames = ['Frame', 'Visibility', 'X', 'Y']
-    writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-    writer.writeheader()
+    fourcc = cv2.VideoWriter_fourcc(*'DIVX' if video_format == 'avi' else 'mp4v')
 
     cap = cv2.VideoCapture(video_file)
     fps = int(cap.get(cv2.CAP_PROP_FPS))
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    success = True
-    frame_count = 0
-    num_final_frame = 0
     ratio = h / HEIGHT
+
     out = cv2.VideoWriter(out_video_file, fourcc, fps, (w, h))
 
-    positions = []
+    with open(out_csv_file, 'w', newline='') as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=['Frame', 'Visibility', 'X', 'Y', 'Direction'])
+        writer.writeheader()
 
-    with tqdm(total=total_frames, desc="Processing frames") as pbar:
-        while success:
-            frame_queue = []
-            for _ in range(num_frame * batch_size):
-                success, frame = cap.read()
-                if not success:
-                    break
-                else:
-                    frame_count += 1
-                    frame_queue.append(frame)
-                    pbar.update(1)
+        positions = []
+        prev_position = (0, 0)
+        frame_count = 0
 
-            if not frame_queue:
-                break
-
-            if len(frame_queue) % num_frame != 0:
+        with tqdm(total=total_frames, desc="Processing frames") as pbar:
+            while True:
                 frame_queue = []
-                num_final_frame = len(frame_queue) + 1
-                frame_count = frame_count - num_frame * batch_size
-                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_count)
                 for _ in range(num_frame * batch_size):
                     success, frame = cap.read()
                     if not success:
                         break
-                    else:
-                        frame_count += 1
-                        frame_queue.append(frame)
-                        pbar.update(1)
-                if len(frame_queue) % num_frame != 0:
-                    continue
+                    frame_count += 1
+                    frame_queue.append(frame)
+                    pbar.update(1)
 
-            x = get_frame_unit(frame_queue, num_frame, device)
+                if not frame_queue:
+                    break
 
-            with torch.no_grad():
-                y_pred = model(x)
-            y_pred = y_pred.detach().cpu().numpy()
-            h_pred = y_pred > 0.5
-            h_pred = h_pred * 255.
-            h_pred = h_pred.astype('uint8')
-            h_pred = h_pred.reshape(-1, HEIGHT, WIDTH)
+                x = get_frame_unit(frame_queue, num_frame, device)
 
-            for i in range(h_pred.shape[0]):
-                if num_final_frame > 0 and i < (num_frame * batch_size - num_final_frame - 1):
-                    continue
-                else:
-                    if i >= len(frame_queue):
-                        break
+                with torch.no_grad():
+                    y_pred = model(x)
 
-                    img = frame_queue[i].copy()
-                    frame_index = frame_count - (num_frame * batch_size) + i
-                    if frame_index in processed_frames and processed_frames[frame_index] == 1:
-                        cx_pred, cy_pred = get_object_center(h_pred[i])
-                        cx_pred, cy_pred = int(ratio * cx_pred), int(ratio * cy_pred)
+                h_pred = (y_pred.detach().cpu().numpy() > 0.5).astype('uint8') * 255
+                h_pred = h_pred.reshape(-1, HEIGHT, WIDTH)
 
-                        if len(positions) > 0 and is_unrealistic_movement(positions[-1], (cx_pred, cy_pred)):
-                            cx_pred, cy_pred = 0, 0  # Mark as invalid if unrealistic movement is detected
+                for i, img in enumerate(frame_queue):
+                    frame_index = frame_count - len(frame_queue) + i
+                    cx_pred, cy_pred = get_object_center(h_pred[i])
+                    cx_pred, cy_pred = int(ratio * cx_pred), int(ratio * cy_pred)
 
-                        vis = 1 if cx_pred > 0 and cy_pred > 0 else 0
-                        positions.append((cx_pred, cy_pred))
-                        writer.writerow({'Frame': frame_index, 'Visibility': vis, 'X': cx_pred, 'Y': cy_pred})
-                        if cx_pred != 0 or cy_pred != 0:
-                            cv2.circle(img, (cx_pred, cy_pred), 5, (0, 0, 255), -1)
+                    if positions and is_unrealistic_movement(positions[-1], (cx_pred, cy_pred)):
+                        cx_pred, cy_pred = 0, 0
+
+                    vis = 1 if cx_pred > 0 and cy_pred > 0 else 0
+                    direction = get_direction(prev_position, (cx_pred, cy_pred))
+                    positions.append((cx_pred, cy_pred))
+                    writer.writerow({
+                        'Frame': frame_index,
+                        'Visibility': vis,
+                        'X': cx_pred,
+                        'Y': cy_pred,
+                        'Direction': direction
+                    })
+
+                    if cx_pred != 0 or cy_pred != 0:
+                        # Use blue for upward movement, red for downward movement
+                        color = (255, 0, 0) if direction == 0 else (0, 0, 255)
+                        cv2.circle(img, (cx_pred, cy_pred), 5, color, -1)
+
+                    prev_position = (cx_pred, cy_pred)
                     out.write(img)
 
-out.release()
-print('Done.')
+    out.release()
+    print('Processing completed.')
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Track badminton shuttle in video.")
+    parser.add_argument('video_file', type=str, help='Path to the video file')
+    parser.add_argument('--model_file', type=str, default='resources/model_best.pt', help='Path to the model file')
+    parser.add_argument('--save_dir', type=str, default='result', help='Directory to save output')
+
+    args = parser.parse_args()
+
+    process_video(args.video_file, args.model_file, args.save_dir)
