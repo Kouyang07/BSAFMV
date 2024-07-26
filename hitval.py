@@ -66,7 +66,7 @@ def annotate_hits(video_path):
         print(f"Hitval file already exists: {hitval_file}")
         if os.path.exists(hit_file):
             print(f"Comparing with hit file: {hit_file}")
-            matched, unmatched_hitval, unmatched_hit = compare_hit_files(hitval_file, hit_file, tolerance=15)  # Changed tolerance to 15
+            matched, unmatched_hitval, unmatched_hit = compare_hit_files(hitval_file, hit_file, tolerance=10)  # Changed tolerance to 15
             print_comparison_results(matched, unmatched_hitval, unmatched_hit)
         else:
             print(f"Hit file not found: {hit_file}")

@@ -1,8 +1,9 @@
+import math
 import sys
 import os
 import pandas as pd
 import numpy as np
-from scipy.signal import savgol_filter
+from scipy.signal import savgol_filter, lfilter, butter
 from sklearn.linear_model import RANSACRegressor
 from sklearn.preprocessing import PolynomialFeatures
 
@@ -17,9 +18,22 @@ def load_shuttle_data(base_name):
     df = pd.read_csv(shuttle_file)
     return df[df['Visibility'] != 0].reset_index(drop=True)
 
-def smooth_trajectory(df, window_length=5, polyorder=2):
-    df['X_smooth'] = savgol_filter(df['X'], window_length, polyorder)
-    df['Y_smooth'] = savgol_filter(df['Y'], window_length, polyorder)
+def butter_lowpass(cutoff, fs, order=5):
+    nyq = 0.5 * fs
+    normal_cutoff = cutoff / nyq
+    b, a = butter(order, normal_cutoff, btype='low', analog=False)
+    return b, a
+
+def butter_lowpass_filter(data, cutoff, fs, order=5):
+    b, a = butter_lowpass(cutoff, fs, order=order)
+    y = lfilter(b, a, data)
+    return y
+
+def smooth_trajectory(df):
+    cutoff = 10  # Adjustable cutoff frequency
+    fs = 30  # Sampling frequency (assuming 30 FPS)
+    df['X_smooth'] = butter_lowpass_filter(df['X'], cutoff, fs)
+    df['Y_smooth'] = butter_lowpass_filter(df['Y'], cutoff, fs)
     return df
 
 def calculate_velocity_acceleration(df):
@@ -33,7 +47,7 @@ def calculate_velocity_acceleration(df):
 
     return df
 
-def estimate_trajectory(df, window_size=30):
+def estimate_trajectory(df, window_size=15):
     df['estimated_y'] = np.nan
     df['trajectory_deviation'] = np.nan
 
@@ -60,7 +74,16 @@ def estimate_trajectory(df, window_size=30):
 
     return df
 
-def detect_hits(df, court_coords, velocity_threshold=50, acceleration_threshold=200, min_frames_between_hits=10, window_size=5):
+def load_player_data(base_name):
+    player_file = f"result/{base_name}_pose.csv"
+    return pd.read_csv(player_file)
+
+def is_near_player(x, y, player_row, threshold=100):  # Adjustable threshold
+    player_center_x = player_row['X']
+    player_center_y = player_row['Y']
+    distance = math.sqrt((x - player_center_x) ** 2 + (y - player_center_y) ** 2)
+    return distance <= threshold
+def detect_hits(df, player_df, court_coords, velocity_threshold=50, acceleration_threshold=200, min_frames_between_hits=10, window_size=5):
     net_y = (court_coords[4][1] + court_coords[5][1]) / 2  # Average y-coordinate of net top
 
     hits = []
@@ -93,8 +116,16 @@ def detect_hits(df, court_coords, velocity_threshold=50, acceleration_threshold=
             direction_change = np.abs(np.diff(np.arctan2(np.diff(window['Y_smooth']), np.diff(window['X_smooth'])))).max()
 
             if velocity_change > velocity_threshold and curr_row['a'] > acceleration_threshold and direction_change > 0.5:
-                hit_detected = True
-                print("  HIT DETECTED")
+                # Check if the shuttle is near a player
+                player_rows = player_df[player_df['Frame'] == curr_row['Frame']]
+                for _, player_row in player_rows.iterrows():
+                    if is_near_player(curr_row['X_smooth'], curr_row['Y_smooth'], player_row):
+                        hit_detected = True
+                        print("  HIT DETECTED")
+                        break
+
+                if not hit_detected:
+                    print("  No hit detected (not near a player)")
             else:
                 print("  No hit detected")
 
@@ -116,14 +147,14 @@ def main(video_path):
 
     court_coords = load_court_coordinates(base_name)
     df = load_shuttle_data(base_name)
+    player_df = load_player_data(base_name)
 
     print(f"Loaded {len(df)} visible shuttle positions")
 
     df = smooth_trajectory(df)
     df = calculate_velocity_acceleration(df)
 
-    hits = detect_hits(df, court_coords, velocity_threshold=50, acceleration_threshold=200, min_frames_between_hits=10, window_size=5)
-
+    hits = detect_hits(df, player_df, court_coords, velocity_threshold=30, acceleration_threshold=150, min_frames_between_hits=10, window_size=10)
     print("\nSummary:")
     print(f"Detected {len(hits)} hits:")
     for hit in hits:
@@ -137,7 +168,6 @@ def main(video_path):
         f.write(','.join(hit_frames))
 
     print(f"\nHit frames saved to {hit_file_path}")
-
 
 
 if __name__ == "__main__":

@@ -1,9 +1,91 @@
+import cv2
+import torch
+import torchvision
+import numpy as np
+import copy
+from PIL import Image
+from torchvision.transforms import transforms
+from torchvision.transforms import functional as F
 import sys
 import csv
 import os
-from ultralytics import YOLO
-import cv2
-import numpy as np
+from tqdm import tqdm
+
+class PoseDetect:
+    def __init__(self):
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.setup_RCNN()
+
+    def reset(self):
+        self.got_info = False
+
+    def setup_RCNN(self):
+        self.__pose_kpRCNN = torch.load('resources/pose_kpRCNN.pth')
+        self.__pose_kpRCNN.to(self.device).eval()
+
+    def del_RCNN(self):
+        del self.__pose_kpRCNN
+
+    def get_human_joints(self, frame):
+        frame_copy = frame.copy()
+        outputs = self.__human_detection(frame_copy)
+        human_joints = outputs[0]['keypoints'].cpu().detach().numpy()
+        filtered_outputs = []
+        for i in range(len(human_joints)):
+            filtered_outputs.append(human_joints[i].tolist())
+
+        for points in filtered_outputs:
+            for i, joints in enumerate(points):
+                points[i] = joints[0:2]
+        filtered_outputs
+        return outputs, filtered_outputs
+
+    def __human_detection(self, frame):
+        pil_image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+        t_image = transforms.Compose(
+            [transforms.ToTensor()])(pil_image).unsqueeze(0).to(self.device)
+        outputs = self.__pose_kpRCNN(t_image)
+        return outputs
+
+    def draw_key_points(self, filtered_outputs, image, human_limit=-1):
+        image_copy = image.copy()
+        edges = [(0, 1), (0, 2), (2, 4), (1, 3), (6, 8), (8, 10), (11, 12),
+                 (5, 7), (7, 9), (5, 11), (11, 13), (13, 15), (6, 12),
+                 (12, 14), (14, 16), (5, 6)]
+
+        # top player is blue and bottom one is red
+        top_color_edge = (255, 0, 0)
+        bot_color_edge = (0, 0, 255)
+        top_color_joint = (115, 47, 14)
+        bot_color_joint = (35, 47, 204)
+
+
+        for i in range(len(filtered_outputs)):
+
+            if i > human_limit and human_limit != -1:
+                break
+
+            color = top_color_edge if i == 0 else bot_color_edge
+            color_joint = top_color_joint if i == 0 else bot_color_joint
+
+            keypoints = np.array(filtered_outputs[i])  # 17, 2
+            keypoints = keypoints[:, :].reshape(-1, 2)
+            for p in range(keypoints.shape[0]):
+                cv2.circle(image_copy,
+                           (int(keypoints[p, 0]), int(keypoints[p, 1])),
+                           3,
+                           color_joint,
+                           thickness=-1,
+                           lineType=cv2.FILLED)
+
+            for e in edges:
+                cv2.line(image_copy,
+                         (int(keypoints[e, 0][0]), int(keypoints[e, 1][0])),
+                         (int(keypoints[e, 0][1]), int(keypoints[e, 1][1])),
+                         color,
+                         2,
+                         lineType=cv2.LINE_AA)
+        return image_copy
 
 def load_processed_frames(processed_csv_file):
     with open(processed_csv_file, 'r') as csvfile:
@@ -36,11 +118,7 @@ def box_intersects_court(box, court_coords):
     x1, y1, x2, y2 = box
     return any(point_inside_polygon(x, y, court_coords) for x, y in [(x1, y1), (x2, y1), (x1, y2), (x2, y2)])
 
-
 def process_video(video_path):
-    # Load the YOLOv10 model
-    model = YOLO("yolov10x.pt")
-
     # Open the video file
     cap = cv2.VideoCapture(video_path)
 
@@ -71,48 +149,70 @@ def process_video(video_path):
     court_path = f"result/{base_name}_court.txt"
     court_coords = read_court_coordinates(court_path)
 
+    # Set up pose detector
+    pose_detector = PoseDetect()
+
+    # Define ROI margin
+    roi_margin = 50
+
+    roi_coords = []
+    for coord in court_coords:
+        x, y = coord
+        x1, y1 = int(x - roi_margin), int(y - roi_margin)
+        x2, y2 = int(x + roi_margin), int(y + roi_margin)
+        x1 = max(0, x1)
+        y1 = max(0, y1)
+        x2 = min(width, x2)
+        y2 = min(height, y2)
+        roi_coords.append((x1, y1))
+        roi_coords.append((x2, y2))
+
     with open(csv_path, 'w', newline='') as csvfile:
         csvwriter = csv.writer(csvfile)
         csvwriter.writerow(['Frame', 'Class', 'Confidence', 'X', 'Y', 'Width', 'Height'])
 
         frame_number = 0
-        while cap.isOpened():
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        for frame_number in tqdm(range(total_frames), desc="Processing video"):
             ret, frame = cap.read()
             if not ret:
                 break
 
             # Check if it's a rally frame
             if rally_frames.get(frame_number, 0) == 1:
-                # Perform detection
-                results = model(frame)
+                # Crop frame to ROI
+                roi_frame = frame[roi_coords[0][1]:roi_coords[1][1], roi_coords[0][0]:roi_coords[1][0]]
+
+                # Run pose detection
+                outputs, filtered_outputs = pose_detector.get_human_joints(roi_frame)
 
                 # Process and write results to CSV
-                for r in results:
-                    boxes = r.boxes
-                    for box in boxes:
-                        # Check if the detected object is a person
-                        if box.cls == 0:  # Assuming class 0 is 'person'
-                            x1, y1, x2, y2 = box.xyxy[0]
+                for i in range(len(filtered_outputs)):
+                    keypoints = np.array(filtered_outputs[i])  # 17, 2
+                    keypoints = keypoints[:, :].reshape(-1, 2)
+                    for p in range(keypoints.shape[0]):
+                        x, y = keypoints[p, :]
+                        x += roi_coords[0][0]
+                        y += roi_coords[0][1]
+                        csvwriter.writerow([frame_number, 'person', 1.0, x, y, 0, 0])
 
-                            # Check if the bounding box intersects with or is inside the court
-                            if box_intersects_court((x1, y1, x2, y2), court_coords):
-                                x, y, w, h = box.xywh[0]
-                                conf = box.conf[0]
-                                csvwriter.writerow([frame_number, 'person', conf.item(), x.item(), y.item(), w.item(), h.item()])
-
-                                # Draw bounding box on the frame
-                                cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
-                                cv2.putText(frame, f'Person: {conf:.2f}', (int(x1), int(y1) - 10),
-                                            cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+                    # Draw pose keypoints on the frame
+                    roi_frame = pose_detector.draw_key_points(filtered_outputs, roi_frame)
 
                 # Draw court lines
                 court_poly = np.array(court_coords, np.int32).reshape((-1, 1, 2))
                 cv2.polylines(frame, [court_poly], True, (255, 0, 0), 2)
+                cv2.rectangle(frame, roi_coords[0], roi_coords[1], (0, 255, 0), 2)
+
+                # Paste ROI frame back into original frame
+                frame[roi_coords[0][1]:roi_coords[1][1], roi_coords[0][0]:roi_coords[1][0]] = roi_frame
 
             # Write the frame to the output video
             out.write(frame)
 
-            frame_number += 1
+            # Debug message
+            if frame_number % 100 == 0:
+                print(f"Processed frame {frame_number} / {total_frames}")
 
     cap.release()
     out.release()
