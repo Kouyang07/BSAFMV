@@ -3,6 +3,8 @@ from tqdm import tqdm
 from scipy.signal import savgol_filter
 from collections import deque
 
+from pose import load_processed_frames
+
 HEIGHT, WIDTH = 288, 512
 DETECTION_THRESHOLD, SMOOTHING_WINDOW = 0.05, 11
 STATIONARY_THRESHOLD, STATIONARY_FRAMES = 10, 10
@@ -134,7 +136,6 @@ def main():
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
     detector = Detector(model_file, num_frame, batch_size, device)
-    post_processor = None
 
     os.makedirs(save_dir, exist_ok=True)
     fourcc = cv2.VideoWriter_fourcc(*('DIVX' if video_format == 'avi' else 'mp4v'))
@@ -143,64 +144,51 @@ def main():
     cap = cv2.VideoCapture(video_file)
     fps, w, h = int(cap.get(cv2.CAP_PROP_FPS)), int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    ratio = h / HEIGHT
     out = cv2.VideoWriter(out_video_file, fourcc, fps, (w, h))
 
     positions = []
     frame_count, rally_frame_buffer = 0, []
 
-    with open(out_csv_file, 'w', newline='') as csvfile:
-        writer = csv.DictWriter(csvfile, fieldnames=['Frame', 'Visibility', 'X', 'Y'])
-        writer.writeheader()
+    with tqdm(total=total_frames, desc="Processing frames") as pbar:
+        while True:
+            success, frame = cap.read()
+            if not success:
+                break
+            frame_count += 1
+            pbar.update(1)
 
-        with tqdm(total=total_frames, desc="Processing frames") as pbar:
-            while True:
-                success, frame = cap.read()
-                if not success:
-                    break
-                frame_count += 1
-                pbar.update(1)
+            is_rally = processed_frames.get(frame_count, 0) == 1
 
-                is_rally = processed_frames.get(frame_count, 0) == 1
+            if is_rally:
+                rally_frame_buffer.append(frame)
+                if len(rally_frame_buffer) == num_frame * batch_size:
+                    detected_positions = detector.detect(rally_frame_buffer, is_rally)
+                    positions.extend(detected_positions)
 
-                if is_rally:
-                    rally_frame_buffer.append(frame)
-                    if len(rally_frame_buffer) == num_frame * batch_size:
-                        detected_positions = detector.detect(rally_frame_buffer, is_rally)
-                        positions.extend(detected_positions)
-
-                        for i, img in enumerate(rally_frame_buffer):
-                            try:
-                                cx_pred, cy_pred = detected_positions[i]
-                                writer.writerow({'Frame': frame_count - len(rally_frame_buffer) + i + 1, 'Visibility': 1, 'X': cx_pred, 'Y': cy_pred})
-                                cv2.circle(img, (cx_pred, cy_pred), 5, (0, 0, 255), -1)
-                                out.write(img)
-                            except Exception as e:
-                                print(f"Error processing frame {frame_count - len(rally_frame_buffer) + i + 1}: {str(e)}")
-                                writer.writerow({'Frame': frame_count - len(rally_frame_buffer) + i + 1, 'Visibility': 0, 'X': 0, 'Y': 0})
-                                out.write(img)
-                        rally_frame_buffer = []
-                else:
-                    if rally_frame_buffer:
-                        for img in rally_frame_buffer:
-                            out.write(img)
-                        rally_frame_buffer = []
-                    writer.writerow({'Frame': frame_count, 'Visibility': 0, 'X': 0, 'Y': 0})
-                    out.write(frame)
-                    positions.append((0, 0))
+                    for i, img in enumerate(rally_frame_buffer):
+                        cx_pred, cy_pred = detected_positions[i]
+                        cv2.circle(img, (cx_pred, cy_pred), 5, (0, 0, 255), -1)
+                        out.write(img)
+                    rally_frame_buffer = []
+            else:
+                if rally_frame_buffer:
+                    for img in rally_frame_buffer:
+                        out.write(img)
+                    rally_frame_buffer = []
+                out.write(frame)
+                positions.append((0, 0))
 
     post_processor = PostProcessor(positions)
     smoothed_positions = post_processor.process()
 
-    with open(out_csv_file, 'r') as csvfile:
-        rows = list(csv.DictReader(csvfile))
-
+    # Write the CSV file with smoothed positions
     with open(out_csv_file, 'w', newline='') as csvfile:
         writer = csv.DictWriter(csvfile, fieldnames=['Frame', 'Visibility', 'X', 'Y'])
         writer.writeheader()
-        for i, (row, smoothed_pos) in enumerate(zip(rows, smoothed_positions)):
-            row['X'], row['Y'] = smoothed_pos
-            writer.writerow(row)
+        for frame, position in enumerate(smoothed_positions, start=1):
+            x, y = position
+            visibility = 1 if x != 0 or y != 0 else 0
+            writer.writerow({'Frame': frame, 'Visibility': visibility, 'X': x, 'Y': y})
 
     out.release()
     print('Done.')
