@@ -38,7 +38,7 @@ class PoseDetect:
         results = self.__pose_model(frame)
         return results
 
-    def draw_key_points(self, results, image, human_limit=-1):
+    def draw_key_points(self, results, image, human_limit=-1, conf_threshold=0.5):
         image_copy = image.copy()
         if results[0].keypoints is None:
             return image_copy  # Return original image if no keypoints detected
@@ -60,20 +60,48 @@ class PoseDetect:
             color = top_color_edge if i == 0 else bot_color_edge
             color_joint = top_color_joint if i == 0 else bot_color_joint
 
+            if person_keypoints.xy is None or person_keypoints.conf is None:
+                continue
+
             xy = person_keypoints.xy[0]
+            conf = person_keypoints.conf[0]
+
             for p in range(xy.shape[0]):
-                x, y = int(xy[p, 0].item()), int(xy[p, 1].item())
-                cv2.circle(image_copy, (x, y), 3, color_joint, thickness=-1, lineType=cv2.FILLED)
+                if conf[p].item() > conf_threshold:
+                    x, y = int(xy[p, 0].item()), int(xy[p, 1].item())
+                    cv2.circle(image_copy, (x, y), 3, color_joint, thickness=-1, lineType=cv2.FILLED)
 
             for e in edges:
                 if e[0] < xy.shape[0] and e[1] < xy.shape[0]:
-                    start_point = (int(xy[e[0], 0].item()), int(xy[e[0], 1].item()))
-                    end_point = (int(xy[e[1], 0].item()), int(xy[e[1], 1].item()))
-                    cv2.line(image_copy, start_point, end_point, color, 2, lineType=cv2.LINE_AA)
+                    if conf[e[0]].item() > conf_threshold and conf[e[1]].item() > conf_threshold:
+                        start_point = (int(xy[e[0], 0].item()), int(xy[e[0], 1].item()))
+                        end_point = (int(xy[e[1], 0].item()), int(xy[e[1], 1].item()))
+                        cv2.line(image_copy, start_point, end_point, color, 2, lineType=cv2.LINE_AA)
 
         return image_copy
 
-    def process_video(self, input_video_path, output_video_path, output_csv_path):
+    def is_point_in_court(self, point, court_points):
+        # Check if point is within the court
+        x, y = point
+        x1, y1 = court_points[0]
+        x2, y2 = court_points[1]
+        x3, y3 = court_points[2]
+
+        # Calculate the area of the triangle formed by the court points
+        area = abs((x1 * (y2 - y3) + x2 * (y3 - y1) + x3 * (y1 - y2)) / 2.0)
+
+        # Calculate the area of the triangle formed by the point and two of the court points
+        area1 = abs((x * (y1 - y2) + x1 * (y2 - y) + x2 * (y - y1)) / 2.0)
+        area2 = abs((x * (y2 - y3) + x2 * (y3 - y) + x3 * (y - y2)) / 2.0)
+        area3 = abs((x * (y3 - y1) + x3 * (y1 - y) + x1 * (y - y3)) / 2.0)
+
+        # Check if the point is within the court
+        if area == area1 + area2 + area3:
+            return True
+
+        return False
+
+    def process_video(self, input_video_path, output_video_path, output_csv_path, preprocessed_csv_path):
         logging.info(f"Processing video: {input_video_path}")
         cap = cv2.VideoCapture(input_video_path)
         fps = cap.get(cv2.CAP_PROP_FPS)
@@ -84,25 +112,77 @@ class PoseDetect:
         frame_index = 0
         csv_data = []
 
+        # Read preprocessed CSV
+        preprocessed_frames = set()
+        with open(preprocessed_csv_path, 'r') as csvfile:
+            reader = csv.DictReader(csvfile)
+            for row in reader:
+                if row['is_rally_scene'] == 'True':
+                    preprocessed_frames.add(int(row['frame']))
+
+        # Define court points
+        court_points = [(1247.14, 435.553), (1421.72, 991.521), (492.556, 996.019)]
+
         with tqdm(total=frame_count, desc="Processing video frames") as pbar:
             while cap.isOpened():
                 ret, frame = cap.read()
                 if not ret:
                     break
 
-                results = self.get_human_joints(frame)
-                frame_with_keypoints = self.draw_key_points(results, frame)
+                if frame_index in preprocessed_frames:
+                    results = self.get_human_joints(frame)
+                    frame_with_keypoints = frame.copy()
+
+                    if results[0].keypoints is not None:
+                        keypoints = results[0].keypoints
+                        for human_idx, person_keypoints in enumerate(keypoints):
+                            if person_keypoints.xy is None or person_keypoints.conf is None:
+                                continue
+                            xy = person_keypoints.xy[0]
+                            conf = person_keypoints.conf[0]
+
+                            # Check if any body part is within the court
+                            is_in_court = False
+                            for joint_idx in range(xy.shape[0]):
+                                if conf[joint_idx].item() > 0.5:
+                                    x, y = int(xy[joint_idx, 0].item()), int(xy[joint_idx, 1].item())
+                                    if self.is_point_in_court((x, y), court_points):
+                                        is_in_court = True
+                                        print(f"Joint {joint_idx} is in court at frame {frame_index}")
+                                        break
+
+                            if is_in_court:
+                                # Draw keypoints for this person
+                                for joint_idx in range(xy.shape[0]):
+                                    if conf[joint_idx].item() > 0.5:
+                                        x, y = int(xy[joint_idx, 0].item()), int(xy[joint_idx, 1].item())
+                                        cv2.circle(frame_with_keypoints, (x, y), 3, (0, 255, 0), thickness=-1, lineType=cv2.FILLED)
+
+                                # Draw edges for this person
+                                edges = [(0, 1), (0, 2), (1, 3), (2, 4), (5, 7), (7, 9), (6, 8), (8, 10), (5, 6),
+                                         (5, 11), (6, 12), (11, 12), (11, 13), (12, 14), (13, 15), (14, 16)]
+                                for e in edges:
+                                    if e[0] < xy.shape[0] and e[1] < xy.shape[0]:
+                                        if conf[e[0]].item() > 0.5 and conf[e[1]].item() > 0.5:
+                                            start_point = (int(xy[e[0], 0].item()), int(xy[e[0], 1].item()))
+                                            end_point = (int(xy[e[1], 0].item()), int(xy[e[1], 1].item()))
+                                            cv2.line(frame_with_keypoints, start_point, end_point, (0, 255, 0), 2, lineType=cv2.LINE_AA)
+
+                                # Append data to CSV
+                                for joint_idx in range(xy.shape[0]):
+                                    csv_data.append([frame_index, human_idx, joint_idx,
+                                                     xy[joint_idx, 0].item(),
+                                                     xy[joint_idx, 1].item(),
+                                                     conf[joint_idx].item()])
+                            else:
+                                print(f"No joints in court at frame {frame_index}")
+                    else:
+                        frame_with_keypoints = frame
+                        print(f"No keypoints detected at frame {frame_index}")
+                else:
+                    frame_with_keypoints = frame
+
                 out.write(frame_with_keypoints)
-
-                if results[0].keypoints is not None:
-                    keypoints = results[0].keypoints
-                    for human_idx, person_keypoints in enumerate(keypoints):
-                        xy = person_keypoints.xy[0]
-                        for joint_idx in range(xy.shape[0]):
-                            csv_data.append([frame_index, human_idx, joint_idx,
-                                             xy[joint_idx, 0].item(),
-                                             xy[joint_idx, 1].item()])
-
                 frame_index += 1
                 pbar.update(1)
 
@@ -111,7 +191,7 @@ class PoseDetect:
 
         with open(output_csv_path, 'w', newline='') as csvfile:
             csvwriter = csv.writer(csvfile)
-            csvwriter.writerow(['frame_index', 'human_index', 'joint_index', 'x', 'y'])
+            csvwriter.writerow(['frame_index', 'human_index', 'joint_index', 'x', 'y', 'confidence'])
             csvwriter.writerows(csv_data)
 
         logging.info(f"Processed video saved as: {output_video_path}")
@@ -128,8 +208,9 @@ if __name__ == "__main__":
     base_name = os.path.splitext(os.path.basename(input_video_path))[0]
     output_video_path = f"result/{base_name}_pose.mp4"
     output_csv_path = f"result/{base_name}_pose.csv"
+    preprocessed_csv_path = f"result/{base_name}_preprocessed.csv"
 
     pose_detect = PoseDetect()
-    pose_detect.process_video(input_video_path, output_video_path, output_csv_path)
+    pose_detect.process_video(input_video_path, output_video_path, output_csv_path, preprocessed_csv_path)
     print(f"Processed video saved as: {output_video_path}")
     print(f"Data saved as: {output_csv_path}")
