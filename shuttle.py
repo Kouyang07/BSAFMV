@@ -1,9 +1,5 @@
 import os, cv2, argparse, numpy as np, torch, csv
 from tqdm import tqdm
-from scipy.signal import savgol_filter
-from collections import deque
-
-from pose import load_processed_frames
 
 HEIGHT, WIDTH = 288, 512
 DETECTION_THRESHOLD, SMOOTHING_WINDOW = 0.05, 11
@@ -118,6 +114,9 @@ class PostProcessor:
         self.positions = self.remove_outliers()
         return self.positions
 
+def load_processed_frames(processed_csv_file):
+    with open(processed_csv_file, 'r') as csvfile:
+        return {int(row['frame']): int(row['is_rally_scene'] == 'True') for row in csv.DictReader(csvfile)}
 
 def main():
     parser = argparse.ArgumentParser()
