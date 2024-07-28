@@ -81,25 +81,23 @@ class PoseDetect:
         return image_copy
 
     def is_point_in_court(self, point, court_points):
-        # Check if point is within the court
         x, y = point
-        x1, y1 = court_points[0]
-        x2, y2 = court_points[1]
-        x3, y3 = court_points[2]
+        n = len(court_points)
+        inside = False
 
-        # Calculate the area of the triangle formed by the court points
-        area = abs((x1 * (y2 - y3) + x2 * (y3 - y1) + x3 * (y1 - y2)) / 2.0)
+        p1x, p1y = court_points[0]
+        for i in range(n+1):
+            p2x, p2y = court_points[i % n]
+            if y > min(p1y, p2y):
+                if y <= max(p1y, p2y):
+                    if x <= max(p1x, p2x):
+                        if p1y != p2y:
+                            xinters = (y-p1y) * (p2x-p1x) / (p2y-p1y) + p1x
+                        if p1x == p2x or x <= xinters:
+                            inside = not inside
+            p1x, p1y = p2x, p2y
 
-        # Calculate the area of the triangle formed by the point and two of the court points
-        area1 = abs((x * (y1 - y2) + x1 * (y2 - y) + x2 * (y - y1)) / 2.0)
-        area2 = abs((x * (y2 - y3) + x2 * (y3 - y) + x3 * (y - y2)) / 2.0)
-        area3 = abs((x * (y3 - y1) + x3 * (y1 - y) + x1 * (y - y3)) / 2.0)
-
-        # Check if the point is within the court
-        if area == area1 + area2 + area3:
-            return True
-
-        return False
+        return inside
 
     def process_video(self, input_video_path, output_video_path, output_csv_path, preprocessed_csv_path):
         logging.info(f"Processing video: {input_video_path}")
@@ -121,7 +119,9 @@ class PoseDetect:
                     preprocessed_frames.add(int(row['frame']))
 
         # Define court points
-        court_points = [(1247.14, 435.553), (1421.72, 991.521), (492.556, 996.019)]
+        court_points_file = f"result/{os.path.splitext(os.path.basename(input_video_path))[0]}_court.txt"
+        with open(court_points_file, 'r') as file:
+            court_points = [tuple(map(float, line.split(';'))) for line in file.readlines()]
 
         with tqdm(total=frame_count, desc="Processing video frames") as pbar:
             while cap.isOpened():
