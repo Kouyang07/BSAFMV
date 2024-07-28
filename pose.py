@@ -38,7 +38,7 @@ class PoseDetect:
         results = self.__pose_model(frame)
         return results
 
-    def draw_key_points(self, results, image, human_limit=-1, conf_threshold=0.5):
+    def draw_key_points(self, results, image, human_limit=-1, conf_threshold=0.3):
         image_copy = image.copy()
         if results[0].keypoints is None:
             return image_copy  # Return original image if no keypoints detected
@@ -84,7 +84,6 @@ class PoseDetect:
         x, y = point
         n = len(court_points)
         inside = False
-
         p1x, p1y = court_points[0]
         for i in range(n+1):
             p2x, p2y = court_points[i % n]
@@ -96,7 +95,6 @@ class PoseDetect:
                         if p1x == p2x or x <= xinters:
                             inside = not inside
             p1x, p1y = p2x, p2y
-
         return inside
 
     def process_video(self, input_video_path, output_video_path, output_csv_path, preprocessed_csv_path):
