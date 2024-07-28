@@ -146,7 +146,9 @@ def main():
     out = cv2.VideoWriter(out_video_file, fourcc, fps, (w, h))
 
     positions = []
-    frame_count, rally_frame_buffer = 0, []
+    frame_count = 0
+    rally_frame_buffer = []
+    csv_data = []
 
     with tqdm(total=total_frames, desc="Processing frames") as pbar:
         while True:
@@ -162,32 +164,27 @@ def main():
                 rally_frame_buffer.append(frame)
                 if len(rally_frame_buffer) == num_frame * batch_size:
                     detected_positions = detector.detect(rally_frame_buffer, is_rally)
-                    positions.extend(detected_positions)
 
                     for i, img in enumerate(rally_frame_buffer):
                         cx_pred, cy_pred = detected_positions[i]
                         cv2.circle(img, (cx_pred, cy_pred), 5, (0, 0, 255), -1)
                         out.write(img)
+                        csv_data.append({'Frame': frame_count - len(rally_frame_buffer) + i, 'Visibility': 1 if cx_pred != 0 or cy_pred != 0 else 0, 'X': cx_pred, 'Y': cy_pred})
                     rally_frame_buffer = []
             else:
                 if rally_frame_buffer:
-                    for img in rally_frame_buffer:
-                        out.write(img)
+                    for i, _ in enumerate(rally_frame_buffer):
+                        out.write(frame)
+                        csv_data.append({'Frame': frame_count - len(rally_frame_buffer) + i, 'Visibility': 0, 'X': 0, 'Y': 0})
                     rally_frame_buffer = []
                 out.write(frame)
-                positions.append((0, 0))
+                csv_data.append({'Frame': frame_count, 'Visibility': 0, 'X': 0, 'Y': 0})
 
-    post_processor = PostProcessor(positions)
-    smoothed_positions = post_processor.process()
-
-    # Write the CSV file with smoothed positions
+    # Write the CSV file with the data used for annotation
     with open(out_csv_file, 'w', newline='') as csvfile:
         writer = csv.DictWriter(csvfile, fieldnames=['Frame', 'Visibility', 'X', 'Y'])
         writer.writeheader()
-        for frame, position in enumerate(smoothed_positions, start=1):
-            x, y = position
-            visibility = 1 if x != 0 or y != 0 else 0
-            writer.writerow({'Frame': frame, 'Visibility': visibility, 'X': x, 'Y': y})
+        writer.writerows(csv_data)
 
     out.release()
     print('Done.')
