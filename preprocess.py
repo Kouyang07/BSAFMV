@@ -1,3 +1,5 @@
+import logging
+
 import cv2
 import numpy as np
 import csv
@@ -93,7 +95,7 @@ def smooth_decisions(decisions, window_size, fps):
 
 def run_detect_script(video_path, output_path):
     print("Running detect script")
-    max_retries = 5
+    max_retries = 15
     for attempt in range(max_retries):
         print(f"Attempt {attempt + 1}/{max_retries}")
         result = subprocess.run(f'./resources/detect {video_path} {output_path}', shell=True, capture_output=True, text=True)
@@ -119,15 +121,15 @@ def process_frame(frame_index, frame, court_corners, lower_hsv, upper_hsv, area_
     return frame_index, check_court_presence(hsv_frame, court_corners, lower_hsv, upper_hsv, area_width)
 
 def process_video(video_path):
-    print(f"Processing video: {video_path}")
+    logging.info(f"Processing video: {video_path}")
     base_name, result_dir = os.path.splitext(os.path.basename(video_path))[0], "result/"
     os.makedirs(result_dir, exist_ok=True)
-    print(f"Results will be saved in {result_dir}")
+    logging.info(f"Results will be saved in {result_dir}")
     coordinates_file = os.path.join(result_dir, f"{base_name}_court.txt")
 
     frame_index = run_detect_script(video_path, coordinates_file)
 
-    print("Opening video file")
+    logging.info("Opening video file")
     cap = cv2.VideoCapture(video_path)
     cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
     ret, frame = cap.read()
@@ -137,31 +139,31 @@ def process_video(video_path):
         raise RuntimeError(f"Error: Could not read frame at index {frame_index}")
 
     court_corners = read_court_coordinates(coordinates_file)
-    print("Converting frame to HSV")
+    logging.info("Converting frame to HSV")
     hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     hsv_values = get_area_hsv_values(hsv_frame, court_corners)
     lower_hsv, upper_hsv = determine_hsv_thresholds(hsv_values)
 
-    print("Reopening video for full processing")
+    logging.info("Reopening video for full processing")
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise RuntimeError("Error: Could not open video")
 
     fourcc, fps = cv2.VideoWriter_fourcc(*'mp4v'), cap.get(cv2.CAP_PROP_FPS)
     width, height = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    print(f"Video properties: {width}x{height} @ {fps} FPS")
+    logging.info(f"Video properties: {width}x{height} @ {fps} FPS")
     out = cv2.VideoWriter(os.path.join(result_dir, f"{base_name}_processed.mp4"), fourcc, fps, (width, height))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    print(f"Total frames to process: {total_frames}")
+    logging.info(f"Total frames to process: {total_frames}")
 
     num_workers = multiprocessing.cpu_count()
-    print(f"Using {num_workers} workers for parallel processing")
+    logging.info(f"Using {num_workers} workers for parallel processing")
     with ThreadPoolExecutor(max_workers=num_workers) as executor:
         futures = []
         for frame_index in tqdm(range(total_frames), desc="Submitting frames for processing"):
             ret, frame = cap.read()
             if not ret:
-                print(f"Reached end of video at frame {frame_index}")
+                logging.info(f"Reached end of video at frame {frame_index}")
                 break
             futures.append(executor.submit(process_frame, frame_index, frame, court_corners, lower_hsv, upper_hsv))
 
@@ -169,18 +171,18 @@ def process_video(video_path):
         for future in tqdm(as_completed(futures), total=len(futures), desc="Processing frames"):
             frame_results.append(future.result())
 
-    print("Sorting frame results")
+    logging.info("Sorting frame results")
     frame_results.sort(key=lambda x: x[0])
 
-    print("Smoothing results")
+    logging.info("Smoothing results")
     smoothed_results = smooth_decisions([result[1] for result in frame_results], window_size=5, fps=fps)
 
-    print("Writing output video")
+    logging.info("Writing output video")
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
     for frame_index in tqdm(range(total_frames), desc="Writing output video"):
         ret, frame = cap.read()
         if not ret:
-            print(f"Reached end of video at frame {frame_index} while writing")
+            logging.info(f"Reached end of video at frame {frame_index} while writing")
             break
         if smoothed_results[frame_index]:
             for i in range(len(court_corners)):
@@ -189,18 +191,22 @@ def process_video(video_path):
     cap.release()
     out.release()
 
-    print("Writing results to CSV")
+    logging.info("Writing results to CSV")
     csv_path = os.path.join(result_dir, f"{base_name}_preprocessed.csv")
     with open(csv_path, 'w', newline='') as csvfile:
         writer = csv.writer(csvfile)
         writer.writerow(["frame", "is_rally_scene"])
         for frame, result in tqdm(enumerate(smoothed_results), total=len(smoothed_results), desc="Writing CSV"):
             writer.writerow([frame, result])
-    print(f"CSV file saved: {csv_path}")
+    logging.info(f"CSV file saved: {csv_path}")
+
+def main(video_path):
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+    process_video(video_path)
+    logging.info(f"Rally scenes results saved to result/")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Process video to detect rally scenes.')
     parser.add_argument('video_path', type=str, help='Path to the input video file.')
     args = parser.parse_args()
-    process_video(args.video_path)
-    print(f"Rally scenes results saved to result/")
+    main(args.video_path)

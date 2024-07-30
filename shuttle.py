@@ -1,3 +1,4 @@
+import logging
 import os, cv2, argparse, numpy as np, torch, csv
 from tqdm import tqdm
 
@@ -118,15 +119,8 @@ def load_processed_frames(processed_csv_file):
     with open(processed_csv_file, 'r') as csvfile:
         return {int(row['frame']): int(row['is_rally_scene'] == 'True') for row in csv.DictReader(csvfile)}
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('video_file', type=str, help='Path to the video file')
-    args = parser.parse_args()
-
-    video_file = args.video_file
-    model_file, num_frame, batch_size = 'resources/model_best.pt', 3, 8
-    save_dir = 'result'
-
+def process_video(video_file, model_file, num_frame, batch_size, save_dir):
+    logging.info(f"Processing video: {video_file}")
     video_name = os.path.splitext(os.path.basename(video_file))[0]
     video_format = os.path.splitext(video_file)[1][1:]
     out_video_file = f'{save_dir}/{video_name}_shuttle.{video_format}'
@@ -187,7 +181,17 @@ def main():
         writer.writerows(csv_data)
 
     out.release()
-    print('Done.')
+    logging.info('Processing completed.')
+
+def main(video_file):
+    model_file, num_frame, batch_size = 'resources/model_best.pt', 3, 8
+    save_dir = 'result'
+
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+    process_video(video_file, model_file, num_frame, batch_size, save_dir)
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description='Process video to detect shuttle positions.')
+    parser.add_argument('video_file', type=str, help='Path to the input video file.')
+    args = parser.parse_args()
+    main(args.video_file)

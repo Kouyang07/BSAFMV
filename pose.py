@@ -195,14 +195,9 @@ class PoseDetect:
         logging.info(f"Processed video saved as: {output_video_path}")
         logging.info(f"Data saved as: {output_csv_path}")
 
-if __name__ == "__main__":
+def main(input_video_path):
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-    if len(sys.argv) != 2:
-        print("Usage: python3 pose.py {path to video}")
-        sys.exit(1)
-
-    input_video_path = sys.argv[1]
     base_name = os.path.splitext(os.path.basename(input_video_path))[0]
     output_video_path = f"result/{base_name}_pose.mp4"
     output_csv_path = f"result/{base_name}_pose.csv"
@@ -210,5 +205,13 @@ if __name__ == "__main__":
 
     pose_detect = PoseDetect()
     pose_detect.process_video(input_video_path, output_video_path, output_csv_path, preprocessed_csv_path)
-    print(f"Processed video saved as: {output_video_path}")
-    print(f"Data saved as: {output_csv_path}")
+    logging.info(f"Processed video saved as: {output_video_path}")
+    logging.info(f"Data saved as: {output_csv_path}")
+
+if __name__ == "__main__":
+    if len(sys.argv) != 2:
+        print("Usage: python3 pose.py <input_video_path>")
+        sys.exit(1)
+
+    input_video_path = sys.argv[1]
+    main(input_video_path)
