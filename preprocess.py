@@ -1,5 +1,4 @@
 import logging
-
 import cv2
 import numpy as np
 import csv
@@ -12,16 +11,25 @@ import multiprocessing
 
 def read_court_coordinates(file_path):
     print(f"Reading court coordinates from {file_path}")
+    coordinates = {}
     with open(file_path, 'r') as file:
-        coordinates = [tuple(map(float, line.strip().split(';'))) for line in file.readlines()[:4]]
+        csv_reader = csv.DictReader(file)
+        for row in csv_reader:
+            coordinates[row['Point']] = (float(row['X']), float(row['Y']))
     print(f"Court coordinates: {coordinates}")
     return coordinates
 
-def get_area_hsv_values(hsv_frame, court_corners, area_width=5):
+def get_area_hsv_values(hsv_frame, court_points, area_width=5):
     print("Extracting HSV values around court lines")
     hsv_values = []
-    for i in tqdm(range(len(court_corners)), desc="Processing court corners"):
-        p1, p2 = court_corners[i], court_corners[(i + 1) % len(court_corners)]
+    court_lines = [
+        ('P1', 'P2'), ('P2', 'P3'), ('P3', 'P4'), ('P4', 'P1'),
+        ('P5', 'P6'), ('P7', 'P8'), ('P9', 'P10'), ('P11', 'P12'),
+        ('P13', 'P14'), ('P15', 'P16'), ('P17', 'P18'), ('P19', 'P20'),
+        ('P21', 'P22')
+    ]
+    for start, end in tqdm(court_lines, desc="Processing court lines"):
+        p1, p2 = court_points[start], court_points[end]
         num_samples = int(np.hypot(p2[0] - p1[0], p2[1] - p1[1]))
         x_values = np.linspace(p1[0], p2[0], num_samples).astype(int)
         y_values = np.linspace(p1[1], p2[1], num_samples).astype(int)
@@ -42,11 +50,17 @@ def determine_hsv_thresholds(hsv_values):
     print(f"Upper HSV threshold: {upper_bound}")
     return lower_bound.astype(int), upper_bound.astype(int)
 
-def check_court_presence(hsv_frame, court_corners, lower_hsv, upper_hsv, area_width=5):
+def check_court_presence(hsv_frame, court_points, lower_hsv, upper_hsv, area_width=5):
     total_in_range = 0
     total_samples = 0
-    for i in range(len(court_corners)):
-        p1, p2 = court_corners[i], court_corners[(i + 1) % len(court_corners)]
+    court_lines = [
+        ('P1', 'P2'), ('P2', 'P3'), ('P3', 'P4'), ('P4', 'P1'),
+        ('P5', 'P6'), ('P7', 'P8'), ('P9', 'P10'), ('P11', 'P12'),
+        ('P13', 'P14'), ('P15', 'P16'), ('P17', 'P18'), ('P19', 'P20'),
+        ('P21', 'P22')
+    ]
+    for start, end in court_lines:
+        p1, p2 = court_points[start], court_points[end]
         num_samples = int(np.hypot(p2[0] - p1[0], p2[1] - p1[1]))
         x_values = np.linspace(p1[0], p2[0], num_samples).astype(int)
         y_values = np.linspace(p1[1], p2[1], num_samples).astype(int)
@@ -116,16 +130,16 @@ def run_detect_script(video_path, output_path):
             return frame_index
     raise ValueError("Failed to extract frame index from detect script output")
 
-def process_frame(frame_index, frame, court_corners, lower_hsv, upper_hsv, area_width=5):
+def process_frame(frame_index, frame, court_points, lower_hsv, upper_hsv, area_width=5):
     hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    return frame_index, check_court_presence(hsv_frame, court_corners, lower_hsv, upper_hsv, area_width)
+    return frame_index, check_court_presence(hsv_frame, court_points, lower_hsv, upper_hsv, area_width)
 
 def process_video(video_path):
     logging.info(f"Processing video: {video_path}")
     base_name, result_dir = os.path.splitext(os.path.basename(video_path))[0], "result/"
     os.makedirs(result_dir, exist_ok=True)
     logging.info(f"Results will be saved in {result_dir}")
-    coordinates_file = os.path.join(result_dir, f"{base_name}_court.txt")
+    coordinates_file = os.path.join(result_dir, f"{base_name}_court.csv")
 
     frame_index = run_detect_script(video_path, coordinates_file)
 
@@ -138,10 +152,10 @@ def process_video(video_path):
     if not ret:
         raise RuntimeError(f"Error: Could not read frame at index {frame_index}")
 
-    court_corners = read_court_coordinates(coordinates_file)
+    court_points = read_court_coordinates(coordinates_file)
     logging.info("Converting frame to HSV")
     hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    hsv_values = get_area_hsv_values(hsv_frame, court_corners)
+    hsv_values = get_area_hsv_values(hsv_frame, court_points)
     lower_hsv, upper_hsv = determine_hsv_thresholds(hsv_values)
 
     logging.info("Reopening video for full processing")
@@ -165,7 +179,7 @@ def process_video(video_path):
             if not ret:
                 logging.info(f"Reached end of video at frame {frame_index}")
                 break
-            futures.append(executor.submit(process_frame, frame_index, frame, court_corners, lower_hsv, upper_hsv))
+            futures.append(executor.submit(process_frame, frame_index, frame, court_points, lower_hsv, upper_hsv))
 
         frame_results = []
         for future in tqdm(as_completed(futures), total=len(futures), desc="Processing frames"):
@@ -179,14 +193,22 @@ def process_video(video_path):
 
     logging.info("Writing output video")
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    court_lines = [
+        ('P1', 'P2'), ('P2', 'P3'), ('P3', 'P4'), ('P4', 'P1'),
+        ('P5', 'P6'), ('P7', 'P8'), ('P9', 'P10'), ('P11', 'P12'),
+        ('P13', 'P21'), ('P14', 'P22'), ('P17', 'P18'), ('P19', 'P20'),
+        ('P21', 'P22')
+    ]
     for frame_index in tqdm(range(total_frames), desc="Writing output video"):
         ret, frame = cap.read()
         if not ret:
             logging.info(f"Reached end of video at frame {frame_index} while writing")
             break
         if smoothed_results[frame_index]:
-            for i in range(len(court_corners)):
-                cv2.line(frame, tuple(map(int, court_corners[i])), tuple(map(int, court_corners[(i + 1) % len(court_corners)])), (0, 255, 0), 2)
+            for start, end in court_lines:
+                cv2.line(frame, tuple(map(int, court_points[start])), tuple(map(int, court_points[end])), (0, 255, 0), 2)
+            # Draw net
+            cv2.line(frame, tuple(map(int, court_points['NetPole1'])), tuple(map(int, court_points['NetPole2'])), (0, 255, 0), 2)
         out.write(frame)
     cap.release()
     out.release()
