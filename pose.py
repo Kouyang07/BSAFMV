@@ -8,6 +8,18 @@ import logging
 from tqdm import tqdm
 from ultralytics import YOLO
 
+
+def load_court_coordinates(court_file):
+    logging.info(f"Reading court coordinates from {court_file}")
+    coordinates = {}
+    with open(court_file, 'r') as file:
+        csv_reader = csv.DictReader(file)
+        for row in csv_reader:
+            coordinates[row['Point']] = (float(row['X']), float(row['Y']))
+    logging.info(f"Court coordinates: {coordinates}")
+    return coordinates
+
+
 class PoseDetect:
     def __init__(self):
         self.device = self.select_device()
@@ -82,11 +94,14 @@ class PoseDetect:
 
     def is_point_in_court(self, point, court_points):
         x, y = point
-        n = len(court_points)
+        court_polygon = [
+            court_points['P1'], court_points['P2'], court_points['P3'], court_points['P4']
+        ]
+        n = len(court_polygon)
         inside = False
-        p1x, p1y = court_points[0]
+        p1x, p1y = court_polygon[0]
         for i in range(n+1):
-            p2x, p2y = court_points[i % n]
+            p2x, p2y = court_polygon[i % n]
             if y > min(p1y, p2y):
                 if y <= max(p1y, p2y):
                     if x <= max(p1x, p2x):
@@ -116,10 +131,9 @@ class PoseDetect:
                 if row['is_rally_scene'] == 'True':
                     preprocessed_frames.add(int(row['frame']))
 
-        # Define court points
-        court_points_file = f"result/{os.path.splitext(os.path.basename(input_video_path))[0]}_court.txt"
-        with open(court_points_file, 'r') as file:
-            court_points = [tuple(map(float, line.split(';'))) for line in file.readlines()]
+        # Load court coordinates
+        court_points_file = f"result/{os.path.splitext(os.path.basename(input_video_path))[0]}_court.csv"
+        court_points = load_court_coordinates(court_points_file)
 
         with tqdm(total=frame_count, desc="Processing video frames") as pbar:
             while cap.isOpened():

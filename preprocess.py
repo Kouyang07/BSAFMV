@@ -174,7 +174,7 @@ def process_video(video_path):
     logging.info(f"Using {num_workers} workers for parallel processing")
     with ThreadPoolExecutor(max_workers=num_workers) as executor:
         futures = []
-        for frame_index in tqdm(range(total_frames), desc="Submitting frames for processing"):
+        for frame_index in tqdm(range(total_frames), desc="Processing frames"):
             ret, frame = cap.read()
             if not ret:
                 logging.info(f"Reached end of video at frame {frame_index}")
@@ -182,7 +182,7 @@ def process_video(video_path):
             futures.append(executor.submit(process_frame, frame_index, frame, court_points, lower_hsv, upper_hsv))
 
         frame_results = []
-        for future in tqdm(as_completed(futures), total=len(futures), desc="Processing frames"):
+        for future in tqdm(as_completed(futures), total=len(futures), desc="Preparing frames for post-processing"):
             frame_results.append(future.result())
 
     logging.info("Sorting frame results")
@@ -196,8 +196,8 @@ def process_video(video_path):
     court_lines = [
         ('P1', 'P2'), ('P2', 'P3'), ('P3', 'P4'), ('P4', 'P1'),
         ('P5', 'P6'), ('P7', 'P8'), ('P9', 'P10'), ('P11', 'P12'),
-        ('P13', 'P21'), ('P14', 'P22'), ('P17', 'P18'), ('P19', 'P20'),
-        ('P21', 'P22')
+        ('P13', 'P21'), ('P14', 'P22'), ('P17', 'P18'), ('P19', 'P20')
+        # Removed ('P21', 'P22')
     ]
     for frame_index in tqdm(range(total_frames), desc="Writing output video"):
         ret, frame = cap.read()
@@ -207,8 +207,6 @@ def process_video(video_path):
         if smoothed_results[frame_index]:
             for start, end in court_lines:
                 cv2.line(frame, tuple(map(int, court_points[start])), tuple(map(int, court_points[end])), (0, 255, 0), 2)
-            # Draw net
-            cv2.line(frame, tuple(map(int, court_points['NetPole1'])), tuple(map(int, court_points['NetPole2'])), (0, 255, 0), 2)
         out.write(frame)
     cap.release()
     out.release()

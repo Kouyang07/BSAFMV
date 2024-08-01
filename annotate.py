@@ -1,3 +1,4 @@
+import csv
 import os
 import cv2
 import pandas as pd
@@ -43,12 +44,16 @@ class VideoAnnotator:
         logging.info(f"Loading preprocessed data from {csv_path}")
         return pd.read_csv(csv_path)
 
-    def load_court_points(self):
-        court_file = os.path.join(self.result_dir, f"{self.base_name}_court.txt")
-        logging.info(f"Loading court points from {court_file}")
-        with open(court_file, 'r') as file:
-            return [tuple(map(float, line.strip().split(';'))) for line in file.readlines()]
-
+    def load_court_coordinates(self):
+        csv_path = os.path.join(self.result_dir, f"{self.base_name}_court.csv")
+        logging.info(f"Reading court coordinates from {csv_path}")
+        coordinates = {}
+        with open(csv_path, 'r') as file:
+            csv_reader = csv.DictReader(file)
+            for row in csv_reader:
+                coordinates[row['Point']] = (float(row['X']), float(row['Y']))
+        logging.info(f"Court coordinates: {coordinates}")
+        return coordinates
     def load_pose_data(self):
         csv_path = os.path.join(self.result_dir, f"{self.base_name}_pose.csv")
         logging.info(f"Loading pose data from {csv_path}")
@@ -68,9 +73,14 @@ class VideoAnnotator:
         return cv2.VideoWriter(output_path, fourcc, fps, (width, height))
 
     def draw_court_lines(self, frame, court_points):
-        for i in range(4):
-            pt1 = (int(court_points[i][0]), int(court_points[i][1]))
-            pt2 = (int(court_points[(i+1)%4][0]), int(court_points[(i+1)%4][1]))
+        court_lines = [
+            ('P1', 'P2'), ('P2', 'P3'), ('P3', 'P4'), ('P4', 'P1'),
+            ('P5', 'P6'), ('P7', 'P8'), ('P9', 'P10'), ('P11', 'P12'),
+            ('P13', 'P21'), ('P14', 'P22'), ('P17', 'P18'), ('P19', 'P20')
+        ]
+        for start, end in court_lines:
+            pt1 = tuple(map(int, court_points[start]))
+            pt2 = tuple(map(int, court_points[end]))
             cv2.line(frame, pt1, pt2, (0, 255, 0), 2)
 
     def draw_shuttle(self, frame, frame_num, shuttle_data):
@@ -107,7 +117,7 @@ class VideoAnnotator:
         logging.info("Starting video annotation")
         shuttle_data = self.load_shuttle_data()
         preprocessed_data = self.load_preprocessed_data()
-        court_points = self.load_court_points()
+        court_points = self.load_court_coordinates()
         pose_data = self.load_pose_data()
 
         video_capture = self.create_video_capture()
