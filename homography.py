@@ -18,8 +18,8 @@ def calculate_reprojection_error(pts_src, pts_dst, h):
     return error
 
 def transform_coordinates(input_csv, output_csv, court_csv):
-    # Read the court points
-    pts_src = read_court_points(court_csv)
+    # Read the court points from CSV
+    pts_src = read_court_points(court_csv)  # Ensure this returns a NumPy array of shape (N, 2)
 
     # Define the destination points (in meters)
     pts_dst = np.array([
@@ -29,7 +29,11 @@ def transform_coordinates(input_csv, output_csv, court_csv):
         [3.05, 4.715], [3.05, 8.68], [0, 6.695], [6.1, 6.695],  # P13, P14, P15, P16
         [0, 0.76], [6.1, 0.76], [0, 12.64], [6.1, 12.64],  # P17, P18, P19, P20
         [3.05, 0], [3.05, 13.4]  # P21, P22
-    ])
+    ], dtype=np.float32)
+
+    # Ensure pts_src has the same shape and number of points as pts_dst
+    if pts_src.shape != pts_dst.shape:
+        raise ValueError("Source and destination points must have the same shape")
 
     # Find the homography matrix
     h, _ = cv2.findHomography(pts_src, pts_dst)
@@ -38,19 +42,20 @@ def transform_coordinates(input_csv, output_csv, court_csv):
     reprojection_error = calculate_reprojection_error(pts_src, pts_dst, h)
     print(f"Reprojection error: {reprojection_error:.4f} meters")
 
-    # Read the CSV file
+    # Read the CSV file containing the points to transform
     df = pd.read_csv(input_csv)
 
-    # Apply the transformation to each frame
+    # Apply the transformation to each point
     for index, row in df.iterrows():
         point_src = np.array([[row['X'], row['Y']]], dtype=np.float32)
-        point_src = point_src.reshape(-1, 1, 2)
+        point_src = point_src.reshape(-1, 1, 2)  # Reshape for cv2.perspectiveTransform
         point_dst = cv2.perspectiveTransform(point_src, h)
         x = float(point_dst[0][0][0])
         y = float(point_dst[0][0][1])
         df.at[index, 'X'] = x
         df.at[index, 'Y'] = y
 
+    # Save the transformed points to the output CSV
     df.to_csv(output_csv, index=False)
     return df, reprojection_error
 
