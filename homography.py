@@ -5,136 +5,113 @@ import sys
 import os
 
 def read_court_points(court_csv):
-    try:
-        df = pd.read_csv(court_csv)
-        df = df[~df['Point'].str.contains('NetPole')]
-        return df[['Point', 'X', 'Y']].values
-    except FileNotFoundError:
-        print(f"Error: File {court_csv} not found.")
-        sys.exit(1)
-    except pd.errors.EmptyDataError:
-        print(f"Error: File {court_csv} is empty.")
-        sys.exit(1)
+    df = pd.read_csv(court_csv)
+    # Exclude net pole points
+    df = df[~df['Point'].str.contains('NetPole')]
+    return df[['X', 'Y']].values
 
-def get_3d_court_points():
-    # Define 3D court points (in meters)
-    court_3d = np.array([
-        [0, 0, 0], [0, 13.4, 0], [6.1, 13.4, 0], [6.1, 0, 0],  # P1, P2, P3, P4
-        [0.46, 0, 0], [0.46, 13.4, 0], [5.64, 13.4, 0], [5.64, 0, 0],  # P5, P6, P7, P8
-        [0, 4.715, 0], [6.1, 4.715, 0], [0, 8.68, 0], [6.1, 8.68, 0],  # P9, P10, P11, P12
-        [3.05, 4.715, 0], [3.05, 8.68, 0], [0, 6.695, 0], [6.1, 6.695, 0],  # P13, P14, P15, P16
-        [0, 0.76, 0], [6.1, 0.76, 0], [0, 12.64, 0], [6.1, 12.64, 0],  # P17, P18, P19, P20
-        [3.05, 0, 0], [3.05, 13.4, 0]  # P21, P22
-    ], dtype=np.float32)
-    return court_3d
-
-def calibrate_camera(court_2d, court_3d):
-    # Estimate camera parameters
-    camera_matrix = np.array([[1000, 0, 960], [0, 1000, 540], [0, 0, 1]], dtype=np.float32)  # Initial guess
-    dist_coeffs = np.zeros((4,1))  # Assume no lens distortion
-
-    success, rotation_vector, translation_vector = cv2.solvePnP(court_3d, court_2d, camera_matrix, dist_coeffs)
-
-    if not success:
-        print("Failed to calibrate camera.")
-        sys.exit(1)
-
-    # Refine camera matrix
-    optimal_camera_matrix, _ = cv2.getOptimalNewCameraMatrix(camera_matrix, dist_coeffs, (1920, 1080), 1, (1920, 1080))
-
-    return optimal_camera_matrix, dist_coeffs, rotation_vector, translation_vector
-
-def project_3d_to_2d(points_3d, camera_matrix, dist_coeffs, rvec, tvec):
-    points_2d, _ = cv2.projectPoints(points_3d, rvec, tvec, camera_matrix, dist_coeffs)
-    return points_2d.reshape(-1, 2)
+def calculate_reprojection_error(pts_src, pts_dst, h):
+    pts_src = pts_src.reshape(-1, 1, 2)
+    pts_dst = pts_dst.reshape(-1, 1, 2)
+    pts_reprojected = cv2.perspectiveTransform(pts_src.astype(np.float32), h)
+    error = np.sqrt(np.mean(np.sum((pts_dst - pts_reprojected) ** 2, axis=2)))
+    return error
 
 def transform_coordinates(input_csv, output_csv, court_csv):
-    court_points = read_court_points(court_csv)
-    court_2d = court_points[:, 1:3].astype(np.float32)
-    court_3d = get_3d_court_points()
+    # Read the court points
+    pts_src = read_court_points(court_csv)
 
-    camera_matrix, dist_coeffs, rvec, tvec = calibrate_camera(court_2d, court_3d)
+    # Define the destination points (in meters)
+    pts_dst = np.array([
+        [0, 13.4], [0, 0], [6.1, 0], [6.1, 13.4],  # P1, P2, P3, P4
+        [0.46, 13.4], [0.46, 0], [5.64, 0], [5.64, 13.4],  # P5, P6, P7, P8
+        [0, 4.715], [6.1, 4.715], [0, 8.68], [6.1, 8.68],  # P9, P10, P11, P12
+        [3.05, 4.715], [3.05, 8.68], [0, 6.695], [6.1, 6.695],  # P13, P14, P15, P16
+        [0, 0.76], [6.1, 0.76], [0, 12.64], [6.1, 12.64],  # P17, P18, P19, P20
+        [3.05, 0], [3.05, 13.4]  # P21, P22
+    ])
 
-    try:
-        df = pd.read_csv(input_csv)
-    except FileNotFoundError:
-        print(f"Error: File {input_csv} not found.")
-        sys.exit(1)
-    except pd.errors.EmptyDataError:
-        print(f"Error: File {input_csv} is empty.")
-        sys.exit(1)
-
-    # Prepare 3D points for reprojection
-    points_3d = np.column_stack((df[['X', 'Y']].values, np.zeros(len(df))))
-
-    # Project 3D points to 2D
-    points_2d = project_3d_to_2d(points_3d, camera_matrix, dist_coeffs, rvec, tvec)
-
-    df[['X', 'Y']] = points_2d
-
-    # Filter out unrealistic points
-    court_width, court_length = 6.1, 13.4
-    df = df[(df['X'] >= 0) & (df['X'] <= court_width) &
-            (df['Y'] >= 0) & (df['Y'] <= court_length)]
-
-    df.to_csv(output_csv, index=False)
+    # Find the homography matrix
+    h, _ = cv2.findHomography(pts_src, pts_dst)
 
     # Calculate reprojection error
-    court_2d_reprojected = project_3d_to_2d(court_3d, camera_matrix, dist_coeffs, rvec, tvec)
-    reprojection_error = np.mean(np.linalg.norm(court_2d - court_2d_reprojected, axis=1))
+    reprojection_error = calculate_reprojection_error(pts_src, pts_dst, h)
+    print(f"Reprojection error: {reprojection_error:.4f} meters")
 
-    print(f"Reprojection error: {reprojection_error:.4f} pixels")
+    # Read the CSV file
+    df = pd.read_csv(input_csv)
 
-    return df, reprojection_error, camera_matrix, dist_coeffs, rvec, tvec
+    # Apply the transformation to each frame
+    for index, row in df.iterrows():
+        point_src = np.array([[row['X'], row['Y']]], dtype=np.float32)
+        point_src = point_src.reshape(-1, 1, 2)
+        point_dst = cv2.perspectiveTransform(point_src, h)
+        x = float(point_dst[0][0][0])
+        y = float(point_dst[0][0][1])
+        df.at[index, 'X'] = x
+        df.at[index, 'Y'] = y
 
-def draw_court(court, left, right, top, bottom):
+    df.to_csv(output_csv, index=False)
+    return df, reprojection_error
+
+def create_video(df, output_video, reprojection_error):
+
+    print(df)
+
+    # Define court dimensions in meters
+    court_width = 6.1
+    court_length = 13.4
+
+    # Define padding (in meters)
+    padding = 1  # 1 meter padding on each side
+
+    # Define scaling factor (pixels per meter)
+    scale = 100  # 100 pixels per meter
+
+    # Calculate dimensions in pixels
+    width_px = int((court_width + 2*padding) * scale)
+    height_px = int((court_length + 2*padding) * scale)
+
+    # Create a black background image
+    court = np.zeros((height_px, width_px, 3), np.uint8)
+
+    # Calculate court coordinates in pixels
+    left = int(padding * scale)
+    right = int((padding + court_width) * scale)
+    top = int(padding * scale)
+    bottom = int((padding + court_length) * scale)
+
+    # Draw the badminton court
     cv2.line(court, (left, bottom), (left, top), (255, 255, 255), 2)  # Left line
     cv2.line(court, (right, bottom), (right, top), (255, 255, 255), 2)  # Right line
     cv2.line(court, (left, bottom), (right, bottom), (255, 255, 255), 2)  # Bottom line
     cv2.line(court, (left, top), (right, top), (255, 255, 255), 2)  # Top line
     cv2.line(court, (left, (top + bottom) // 2), (right, (top + bottom) // 2), (255, 255, 255), 1)  # Net
 
-def create_video(df, output_video, reprojection_error, camera_params):
-    court_width, court_length = 6.1, 13.4
-    padding = 1  # 1 meter padding on each side
-    scale = 100  # 100 pixels per meter
-
-    width_px = int((court_width + 2*padding) * scale)
-    height_px = int((court_length + 2*padding) * scale)
-
-    court = np.zeros((height_px, width_px, 3), np.uint8)
-
-    left = int(padding * scale)
-    right = int((padding + court_width) * scale)
-    top = int(padding * scale)
-    bottom = int((padding + court_length) * scale)
-
-    draw_court(court, left, right, top, bottom)
-
+    # Create a video writer
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    fps = 30
+    fps = 10
     out = cv2.VideoWriter(output_video, fourcc, fps, (width_px, height_px))
 
-    camera_matrix, dist_coeffs, rvec, tvec = camera_params
-
+    # Draw the shuttle positions on the court
     for index, row in df.iterrows():
         court_copy = court.copy()
 
+        # Display frame number, x, y position, and homography accuracy
         frame_info = f"Frame: {int(row['Frame'])}"
         position_info = f"X: {row['X']:.2f}, Y: {row['Y']:.2f}"
-        accuracy_info = f"Reprojection Error: {reprojection_error:.4f} pixels"
-        camera_info = f"Camera: f={camera_matrix[0,0]:.1f}, cx={camera_matrix[0,2]:.1f}, cy={camera_matrix[1,2]:.1f}"
+        accuracy_info = f"Homography Error: {reprojection_error:.4f} m"
 
-        cv2.putText(court_copy, frame_info, (10, height_px - 120), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        cv2.putText(court_copy, position_info, (10, height_px - 90), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        cv2.putText(court_copy, accuracy_info, (10, height_px - 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        cv2.putText(court_copy, camera_info, (10, height_px - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        cv2.putText(court_copy, frame_info, (10, height_px // 2 - 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        cv2.putText(court_copy, position_info, (10, height_px // 2 - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        cv2.putText(court_copy, accuracy_info, (10, height_px // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
         x = int((row['X'] + padding) * scale)
-        y = int((row['Y'] + padding) * scale)
+        y = int((court_length - row['Y'] + padding) * scale)  # Flip Y-axis
         cv2.circle(court_copy, (x, y), 5, (0, 255, 0), -1)
         out.write(court_copy)
 
+    # Release the video writer
     out.release()
 
 def main(input_video):
@@ -144,15 +121,13 @@ def main(input_video):
     transformed_csv = f'result/{base_name}_shuttle_transformed.csv'
     output_video = f'result/{base_name}_visualization.mp4'
 
-    df, reprojection_error, camera_matrix, dist_coeffs, rvec, tvec = transform_coordinates(input_csv, transformed_csv, court_csv)
-    camera_params = (camera_matrix, dist_coeffs, rvec, tvec)
-    create_video(df, output_video, reprojection_error, camera_params)
+    # Transform coordinates and get reprojection error
+    df, reprojection_error = transform_coordinates(input_csv, transformed_csv, court_csv)
+
+    # Create visualization video
+    create_video(df, output_video, reprojection_error)
 
     print(f"Visualization video created: {output_video}")
-    print(f"Camera Matrix:\n{camera_matrix}")
-    print(f"Distortion Coefficients: {dist_coeffs.ravel()}")
-    print(f"Rotation Vector: {rvec.ravel()}")
-    print(f"Translation Vector: {tvec.ravel()}")
 
 if __name__ == "__main__":
     if len(sys.argv) != 2:

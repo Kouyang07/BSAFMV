@@ -207,6 +207,8 @@ def process_video(video_path):
         if smoothed_results[frame_index]:
             for start, end in court_lines:
                 cv2.line(frame, tuple(map(int, court_points[start])), tuple(map(int, court_points[end])), (0, 255, 0), 2)
+                cv2.putText(frame, f"{start}", tuple(map(int, court_points[start])), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                cv2.putText(frame, f"{end}", tuple(map(int, court_points[end])), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
         out.write(frame)
     cap.release()
     out.release()
