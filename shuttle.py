@@ -1,11 +1,16 @@
-import logging
-import os, cv2, argparse, numpy as np, torch, csv
+import os
+import cv2
+import argparse
+import numpy as np
+import torch
+import csv
 from tqdm import tqdm
 
+# Constants
 HEIGHT, WIDTH = 288, 512
-DETECTION_THRESHOLD, SMOOTHING_WINDOW = 0.05, 11
-STATIONARY_THRESHOLD, STATIONARY_FRAMES = 10, 10
-BASE_TELEPORT_THRESHOLD, MAX_ESTIMATION_FRAMES = 60, 5
+DETECTION_THRESHOLD = 0.05
+SMOOTHING_WINDOW_SIZE = 5  # Window size for moving average smoothing
+TELEPORTATION_THRESHOLD = 50  # Threshold distance to consider as teleportation
 
 class Detector:
     def __init__(self, model_file, num_frame, batch_size, device):
@@ -25,15 +30,25 @@ class Detector:
         return model
 
     def get_frame_unit(self, frame_list):
-        batch = [np.array([cv2.resize(img, (WIDTH, HEIGHT)) for img in frame_list[i:i + self.num_frame]]).transpose(
-            (0, 3, 1, 2)).reshape(-1, HEIGHT, WIDTH) / 255.0 for i in range(0, len(frame_list), self.num_frame)]
-        return torch.FloatTensor(np.array(batch)).to(self.device)
+        batch = []
+        for i in range(0, len(frame_list), self.num_frame):
+            frames = frame_list[i:i + self.num_frame]
+            if len(frames) < self.num_frame:
+                continue
+            frames_resized = [cv2.resize(img, (WIDTH, HEIGHT)) for img in frames]
+            frames_np = np.array(frames_resized).transpose((0, 3, 1, 2)).reshape(-1, HEIGHT, WIDTH)
+            frames_np = frames_np / 255.0  # Normalize to [0,1]
+            batch.append(frames_np)
+
+        if len(batch) == 0:
+            return None
+
+        batch_np = np.array(batch)
+        batch_tensor = torch.FloatTensor(batch_np).to(self.device)
+        return batch_tensor
 
     def get_object_center(self, heatmap):
-        if np.amax(heatmap) < DETECTION_THRESHOLD:
-            return 0, 0
-        binary = cv2.threshold(heatmap, DETECTION_THRESHOLD, 255, cv2.THRESH_BINARY)[1]
-        contours, _ = cv2.findContours(binary.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours, _ = cv2.findContours(heatmap.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
             return 0, 0
         largest_contour = max(contours, key=cv2.contourArea)
@@ -44,105 +59,140 @@ class Detector:
         cy = int(M["m01"] / M["m00"])
         return cx, cy
 
-    def detect(self, frame_buffer, is_rally):
+    def detect(self, frame_buffer):
         x = self.get_frame_unit(frame_buffer)
+        if x is None:
+            return [(0, 0)] * len(frame_buffer)  # No detection, return empty positions
+
         with torch.no_grad():
             y_pred = self.model(x)
         h_pred = (y_pred.detach().cpu().numpy() > 0.5).astype('uint8') * 255
         h_pred = h_pred.reshape(-1, HEIGHT, WIDTH)
 
         positions = []
-        for i, img in enumerate(frame_buffer):
-            cx_pred, cy_pred = self.get_object_center(h_pred[i])
-            if is_rally:
-                cx_pred, cy_pred = int(img.shape[0] / HEIGHT * cx_pred), int(img.shape[1] / WIDTH * cy_pred)
-            else:
-                cx_pred, cy_pred = 0, 0
-            positions.append((cx_pred, cy_pred))
-
+        for i in range(h_pred.shape[0]):
+            heatmap = h_pred[i]
+            cx, cy = self.get_object_center(heatmap)
+            img = frame_buffer[i]
+            cx = int(img.shape[1] / WIDTH * cx)
+            cy = int(img.shape[0] / HEIGHT * cy)
+            positions.append((cx, cy))
         return positions
-
-
 class PostProcessor:
     def __init__(self, positions):
         self.positions = positions
 
-    def smooth_trajectory(self):
-        smoothed_positions = []
-        window_size = 10
-        for i in range(len(self.positions)):
-            window = self.positions[max(0, i - window_size // 2):min(len(self.positions), i + window_size // 2 + 1)]
-            x = sum(p[0] for p in window) / len(window)
-            y = sum(p[1] for p in window) / len(window)
-            smoothed_positions.append((x, y))
-        return smoothed_positions
+    def smooth_positions(self):
+        # Your existing smoothing code (if any)
+        pass
 
-    def remove_stationary_segments(self):
-        filtered_positions = []
-        for i in range(len(self.positions)):
-            if self.positions[i][0] != 0 or self.positions[i][1] != 0:
-                filtered_positions.append(self.positions[i])
-            elif i > 0 and i < len(self.positions) - 1:
-                if self.positions[i-1][0] != 0 and self.positions[i+1][0] != 0:
-                    filtered_positions.append(self.estimate_position(self.positions[i-1], self.positions[i+1]))
-                else:
-                    filtered_positions.append((0, 0))
+    def detect_teleportations(self):
+        corrected_positions = []
+        i = 0
+        MAX_EXTRAPOLATION_GAP = 5  # Maximum number of frames to extrapolate over
+        MIN_POINTS_FOR_EXTRAPOLATION = 3  # Minimum number of points needed before the gap
+
+        while i < len(self.positions):
+            curr_pos = self.positions[i]
+
+            if curr_pos != (0, 0):
+                corrected_positions.append(curr_pos)
+                i += 1
             else:
-                filtered_positions.append((0, 0))
-        return filtered_positions
+                # Find the start and end indices of the gap
+                gap_start = i
+                gap_end = i
+                while gap_end < len(self.positions) and self.positions[gap_end] == (0, 0):
+                    gap_end += 1
 
-    def estimate_position(self, prev_pos, next_pos):
-        return (prev_pos[0] + next_pos[0]) // 2, (prev_pos[1] + next_pos[1]) // 2
+                gap_length = gap_end - gap_start
 
-    def remove_outliers(self):
-        filtered_positions = []
-        for i in range(len(self.positions)):
-            if self.positions[i][0] != 0 or self.positions[i][1] != 0:
-                if i > 0 and i < len(self.positions) - 1:
-                    if abs(self.positions[i][0] - self.positions[i-1][0]) > 50 or abs(self.positions[i][0] - self.positions[i+1][0]) > 50:
-                        filtered_positions.append((0, 0))
+                if gap_length <= MAX_EXTRAPOLATION_GAP:
+                    # Collect positions before the gap
+                    before_indices = []
+                    b = gap_start - 1
+                    while b >= 0 and self.positions[b] != (0, 0):
+                        before_indices.insert(0, b)  # Insert at the beginning
+                        b -= 1
+                        if len(before_indices) == MIN_POINTS_FOR_EXTRAPOLATION:
+                            break
+
+                    if len(before_indices) >= 2:
+                        times = before_indices
+                        xs = [self.positions[idx][0] for idx in times]
+                        ys = [self.positions[idx][1] for idx in times]
+
+                        # Normalize time to start from zero
+                        t0 = times[0]
+                        t = [idx - t0 for idx in times]
+
+                        # Fit quadratic functions to x and y over time
+                        # For upward motion, y decreases in image coordinates
+                        coeffs_x = np.polyfit(t, xs, 2)
+                        coeffs_y = np.polyfit(t, ys, 2)
+
+                        # Extrapolate positions during the gap
+                        for k in range(gap_length):
+                            gap_time = (gap_start + k) - t0
+                            interp_x = int(np.polyval(coeffs_x, gap_time))
+                            interp_y = int(np.polyval(coeffs_y, gap_time))
+                            corrected_positions.append((interp_x, interp_y))
                     else:
-                        filtered_positions.append(self.positions[i])
+                        # Not enough points to extrapolate, fill with zeros
+                        corrected_positions.extend([(0, 0)] * gap_length)
                 else:
-                    filtered_positions.append(self.positions[i])
-            else:
-                filtered_positions.append((0, 0))
-        return filtered_positions
+                    # Gap too large, do not extrapolate
+                    corrected_positions.extend([(0, 0)] * gap_length)
+
+                i = gap_end
+        return corrected_positions
 
     def process(self):
-        self.positions = self.smooth_trajectory()
-        self.positions = self.remove_stationary_segments()
-        self.positions = self.remove_outliers()
-        return self.positions
+        # Proceed with the corrected positions
+        corrected_positions = self.detect_teleportations()
+        return corrected_positions
 
-def load_processed_frames(processed_csv_file):
-    with open(processed_csv_file, 'r') as csvfile:
-        return {int(row['frame']): int(row['is_rally_scene'] == 'True') for row in csv.DictReader(csvfile)}
+def load_processed_frames(preprocessed_csv_file):
+    processed_frames = {}
+    if os.path.exists(preprocessed_csv_file):
+        with open(preprocessed_csv_file, 'r') as csvfile:
+            reader = csv.DictReader(csvfile)
+            for row in reader:
+                frame_num = int(row['frame'])
+                is_rally = int(row['is_rally_scene'] == 'True')
+                processed_frames[frame_num] = is_rally
+    else:
+        print(f"Warning: {preprocessed_csv_file} does not exist. Assuming all frames are rally scenes.")
+    return processed_frames
 
 def process_video(video_file, model_file, num_frame, batch_size, save_dir):
-    logging.info(f"Processing video: {video_file}")
     video_name = os.path.splitext(os.path.basename(video_file))[0]
     video_format = os.path.splitext(video_file)[1][1:]
     out_video_file = f'{save_dir}/{video_name}_shuttle.{video_format}'
     out_csv_file = f'{save_dir}/{video_name}_shuttle.csv'
     preprocessed_csv_file = f'{save_dir}/{video_name}_preprocessed.csv'
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
+    device = torch.device('cuda' if torch.cuda.is_available() else
+                          'mps' if torch.backends.mps.is_available() else 'cpu')
+    print(f"Using device: {device}")
     detector = Detector(model_file, num_frame, batch_size, device)
 
     os.makedirs(save_dir, exist_ok=True)
     fourcc = cv2.VideoWriter_fourcc(*('DIVX' if video_format == 'avi' else 'mp4v'))
-    processed_frames = load_processed_frames(preprocessed_csv_file)
 
     cap = cv2.VideoCapture(video_file)
-    fps, w, h = int(cap.get(cv2.CAP_PROP_FPS)), int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = int(cap.get(cv2.CAP_PROP_FPS))
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    out = cv2.VideoWriter(out_video_file, fourcc, fps, (w, h))
+    out = cv2.VideoWriter(out_video_file, fourcc, fps, (width, height))
 
     positions = []
+    frame_buffer = []
     frame_count = 0
-    rally_frame_buffer = []
     csv_data = []
+
+    processed_frames = load_processed_frames(preprocessed_csv_file)
 
     with tqdm(total=total_frames, desc="Processing frames") as pbar:
         while True:
@@ -152,42 +202,62 @@ def process_video(video_file, model_file, num_frame, batch_size, save_dir):
             frame_count += 1
             pbar.update(1)
 
-            is_rally = processed_frames.get(frame_count, 0) == 1
+            is_rally = processed_frames.get(frame_count, 1) == 1  # Default to rally if not specified
 
             if is_rally:
-                rally_frame_buffer.append(frame)
-                if len(rally_frame_buffer) == num_frame * batch_size:
-                    detected_positions = detector.detect(rally_frame_buffer, is_rally)
+                frame_buffer.append(frame)
 
-                    for i, img in enumerate(rally_frame_buffer):
-                        cx_pred, cy_pred = detected_positions[i]
-                        cv2.circle(img, (cx_pred, cy_pred), 5, (0, 0, 255), -1)
-                        out.write(img)
-                        csv_data.append({'Frame': frame_count - len(rally_frame_buffer) + i, 'Visibility': 1 if cx_pred != 0 or cy_pred != 0 else 0, 'X': cx_pred, 'Y': cy_pred})
-                    rally_frame_buffer = []
+                # Perform detection when enough frames are collected
+                if len(frame_buffer) == num_frame * batch_size:
+                    detected_positions = detector.detect(frame_buffer)
+                    positions.extend(detected_positions)
+                    frame_buffer = []
             else:
-                if rally_frame_buffer:
-                    for i, _ in enumerate(rally_frame_buffer):
-                        out.write(frame)
-                        csv_data.append({'Frame': frame_count - len(rally_frame_buffer) + i, 'Visibility': 0, 'X': 0, 'Y': 0})
-                    rally_frame_buffer = []
-                out.write(frame)
-                csv_data.append({'Frame': frame_count, 'Visibility': 0, 'X': 0, 'Y': 0})
+                # If not a rally frame, append (0, 0) for position
+                positions.append((0, 0))
 
-    # Write the CSV file with the data used for annotation
+    # Process remaining frames in the buffer
+    if frame_buffer:
+        detected_positions = detector.detect(frame_buffer)
+        positions.extend(detected_positions)
+
+    post_processor = PostProcessor(positions)
+    processed_positions = post_processor.process()
+
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    frame_count = 0
+
+    with tqdm(total=total_frames, desc="Writing output video") as pbar:
+        for pos in processed_positions:
+            success, frame = cap.read()
+            if not success:
+                break
+            frame_count += 1
+            pbar.update(1)
+
+            cx, cy = pos
+            if cx != 0 or cy != 0:
+                cv2.circle(frame, (cx, cy), 5, (0, 0, 255), -1)
+
+            cv2.putText(frame, f"Frame: {frame_count}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+            out.write(frame)
+            csv_data.append({'Frame': frame_count, 'Visibility': 1 if cx != 0 or cy != 0 else 0, 'X': cx, 'Y': cy})
+
+    # Save CSV file
     with open(out_csv_file, 'w', newline='') as csvfile:
         writer = csv.DictWriter(csvfile, fieldnames=['Frame', 'Visibility', 'X', 'Y'])
         writer.writeheader()
         writer.writerows(csv_data)
 
     out.release()
-    logging.info('Processing completed.')
+    cap.release()
 
 def main(video_file):
-    model_file, num_frame, batch_size = 'resources/model_best.pt', 3, 8
+    model_file = 'resources/model_best.pt'
+    num_frame = 3
+    batch_size = 8
     save_dir = 'result'
 
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
     process_video(video_file, model_file, num_frame, batch_size, save_dir)
 
 if __name__ == "__main__":
