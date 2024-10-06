@@ -369,6 +369,7 @@ def main():
                     frame_data = frames.get(frame_index, {})
 
                     # Plot player positions
+                    # Plot player positions
                     for human_index in sorted(frame_data.keys()):
                         img_point = frame_data[human_index]
 
@@ -382,11 +383,18 @@ def main():
 
                         # Ensure pixel coordinates are within court image boundaries
                         if 0 <= pixel_x < court_width_px and 0 <= pixel_y < court_height_px:
+                            # Determine if the player is on the bottom or upper half
+                            if Y_world < 6.7:
+                                color = (0, 0, 255)  # Red for bottom half
+                            else:
+                                color = (0, 255, 0)  # Green for upper half
+
                             # Plot the player's position on the court image
-                            color = (0, 0, 255) if human_index == 0 else (0, 255, 0)  # Different colors for players
                             cv2.circle(court_image, (pixel_x, pixel_y), 5, color, -1)
-                            cv2.putText(court_image, f'P{human_index + 1}', (pixel_x + 5, pixel_y - 5),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+
+                            # Remove text labels
+                            # cv2.putText(court_image, f'P{human_index + 1}', (pixel_x + 5, pixel_y - 5),
+                            #             cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
                         else:
                             logging.warning(f"Player {human_index} position out of court bounds at frame {frame_index}")
 
