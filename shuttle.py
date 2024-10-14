@@ -66,7 +66,7 @@ class Detector:
 
         with torch.no_grad():
             y_pred = self.model(x)
-        h_pred = (y_pred.detach().cpu().numpy() > 0.5).astype('uint8') * 255
+        h_pred = (y_pred.detach().cpu().numpy() > 0.7).astype('uint8') * 255
         h_pred = h_pred.reshape(-1, HEIGHT, WIDTH)
 
         positions = []
