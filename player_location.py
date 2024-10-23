@@ -6,6 +6,7 @@ import pandas as pd
 import argparse
 import logging
 from tqdm import tqdm
+import csv  # Added import for CSV operations
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -190,39 +191,143 @@ def read_pose_data(pose_csv):
         raise e
 
 
-def compute_player_locations(grouped):
+def low_pass_filter(current_value, previous_value, alpha):
     """
-    Computes the player's foot positions as the midpoint between both ankles (left and right) in image coordinates.
+    Applies a low-pass filter to the given values to smooth out spikes.
+
+    Args:
+        current_value (float): The current value (e.g., velocity component).
+        previous_value (float): The previous filtered value.
+        alpha (float): The smoothing factor.
+
+    Returns:
+        float: The filtered value.
+    """
+    return alpha * current_value + (1 - alpha) * previous_value
+
+
+def compute_player_locations(grouped, base_alpha=0.3, max_prediction_frames=5, min_confidence_threshold=0.5, direction_change_threshold=0.1):
+    """
+    Computes the player's foot positions as the midpoint between both ankles (left and right) in image coordinates,
+    applies double exponential smoothing and a low-pass filter to reduce spikes in the velocity graph.
 
     Args:
         grouped (pd.core.groupby.generic.DataFrameGroupBy): Grouped pose data by frame and human.
+        base_alpha (float): The base smoothing factor for EMA. A smaller value results in smoother positions.
+        max_prediction_frames (int): The maximum number of frames to predict the player's position when ankles are not visible.
+        min_confidence_threshold (float): Minimum confidence threshold to consider limbs visible.
+        direction_change_threshold (float): The threshold to detect significant direction changes (lower values make it more sensitive).
 
     Returns:
-        dict: A dictionary with keys as (frame_index, human_index) and values as image coordinates.
+        dict: A dictionary with keys as (frame_index, human_index) and values as smoothed image coordinates.
     """
     results = {}
+    previous_positions = {}  # Store past positions for each player
+    previous_velocities = {}  # Store the estimated velocity of each player
+    smoothed_velocities = {}  # Store the low-pass filtered velocities
+    frames_without_ankle = {}  # Track how many frames the ankles are missing
+    last_confidences = {}  # Track last known confidence levels
+
     for (frame_index, human_index), joints in grouped:
         # Use joints 15 and 16 for ankles
         ankle_joints = joints[joints['joint_index'].isin([15, 16])]
-        high_confidence = ankle_joints[ankle_joints['confidence'] > 0.7]
-
-        if len(high_confidence) == 2:
-            # If both ankles have high confidence, compute the midpoint
-            x = high_confidence['x'].mean()
-            y = high_confidence['y'].mean()
-        elif len(high_confidence) == 1:
-            # If only one ankle has high confidence, use it
-            x = high_confidence.iloc[0]['x']
-            y = high_confidence.iloc[0]['y']
-        else:
-            # If no joints with high confidence, skip this player
-            continue
+        high_confidence = ankle_joints[ankle_joints['confidence'] > min_confidence_threshold]
 
         key = (frame_index, human_index)
-        results[key] = np.array([x, y], dtype=np.float32)
+
+        if len(high_confidence) == 2:
+            # Both ankles have high confidence, compute midpoint
+            x = high_confidence['x'].mean()
+            y = high_confidence['y'].mean()
+
+            # Update confidence tracking
+            last_confidences[key] = high_confidence['confidence'].mean()
+
+            # Reset the missing frames count
+            frames_without_ankle[key] = 0
+        elif len(high_confidence) == 1:
+            # One ankle visible, use the detected one
+            x = high_confidence.iloc[0]['x']
+            y = high_confidence.iloc[0]['y']
+
+            # Update confidence tracking
+            last_confidences[key] = high_confidence['confidence'].mean()
+
+            # Reset the missing frames count
+            frames_without_ankle[key] = 0
+        else:
+            # If no ankles are detected, predict based on last known position
+            if key in previous_positions:
+                # Predict position using velocity if available
+                if key in previous_velocities:
+                    velocity_x, velocity_y = previous_velocities[key]
+                    last_x, last_y = previous_positions[key]
+                    x = last_x + velocity_x
+                    y = last_y + velocity_y
+                else:
+                    x, y = previous_positions[key]  # Use last known position if no velocity
+
+                # Count how many frames the ankles have been missing
+                frames_without_ankle[key] = frames_without_ankle.get(key, 0) + 1
+                if frames_without_ankle[key] > max_prediction_frames:
+                    logging.warning(f"Player {human_index} has been missing for too long at frame {frame_index}.")
+                    continue  # Stop predicting for this player if out too long
+            else:
+                # If no previous data, skip this player
+                continue
+
+        # Determine the smoothing factor based on velocity changes
+        if key in previous_velocities:
+            prev_velocity_x, prev_velocity_y = previous_velocities[key]
+            current_velocity_x = x - previous_positions[key][0]
+            current_velocity_y = y - previous_positions[key][1]
+
+            # Calculate velocity difference (magnitude change in direction)
+            velocity_diff = np.sqrt((current_velocity_x - prev_velocity_x) ** 2 + (current_velocity_y - prev_velocity_y) ** 2)
+            current_velocity_mag = np.sqrt(current_velocity_x ** 2 + current_velocity_y ** 2)
+
+            # If the velocity difference is small, increase smoothing for smoother movement
+            if velocity_diff < direction_change_threshold and current_velocity_mag > 0:
+                adaptive_alpha = min(1.0, base_alpha * (1.0 + current_velocity_mag))
+            else:
+                adaptive_alpha = base_alpha  # Use base smoothing factor when direction changes
+
+        else:
+            adaptive_alpha = base_alpha  # First time, use the base alpha
+
+        # Apply the adaptive EMA for smoothing the position
+        if key in previous_positions:
+            prev_x, prev_y = previous_positions[key]
+            smoothed_x = adaptive_alpha * x + (1 - adaptive_alpha) * prev_x
+            smoothed_y = adaptive_alpha * y + (1 - adaptive_alpha) * prev_y
+        else:
+            smoothed_x, smoothed_y = x, y  # No previous position, start with current
+
+        # Store the smoothed position
+        previous_positions[key] = (smoothed_x, smoothed_y)
+        results[key] = np.array([smoothed_x, smoothed_y], dtype=np.float32)
+
+        # Estimate the velocity for prediction in future frames
+        if key in previous_positions:
+            prev_x, prev_y = previous_positions[key]
+            velocity_x = smoothed_x - prev_x
+            velocity_y = smoothed_y - prev_y
+
+            # Apply a low-pass filter to smooth the velocity
+            if key in smoothed_velocities:
+                velocity_x = low_pass_filter(velocity_x, smoothed_velocities[key][0], base_alpha)
+                velocity_y = low_pass_filter(velocity_y, smoothed_velocities[key][1], base_alpha)
+
+            smoothed_velocities[key] = (velocity_x, velocity_y)
+            previous_velocities[key] = (velocity_x, velocity_y)
+
+        # Predict visibility based on confidence history
+        if key in last_confidences and frames_without_ankle[key] > 0:
+            # If confidence was high previously, predict that the limb is still likely visible
+            if last_confidences[key] > min_confidence_threshold:
+                logging.info(f"Predicting visibility for Player {human_index} at frame {frame_index} based on previous confidence.")
+
     return results
-
-
 def draw_court(image, court_height_px, court_width_px):
     """
     Draws the court lines on the schematic court image.
@@ -303,6 +408,9 @@ def main():
         else:
             output_video_path = f'result/{video_name_without_ext}_player_positions.mp4'
 
+        # Ensure the 'result' directory exists
+        os.makedirs('result', exist_ok=True)
+
         # Step 1: Camera Calibration
         world_points = define_world_points()
         image_points = read_court_points(court_csv)
@@ -326,6 +434,23 @@ def main():
             # Step 2: Read Pose Data and Compute Player Locations
             grouped = read_pose_data(pose_csv)
             player_image_points = compute_player_locations(grouped)
+
+            # Save player positions to CSV
+            output_csv_path = os.path.join('result', f'{video_name_without_ext}_position.csv')
+            with open(output_csv_path, 'w', newline='') as csvfile:
+                writer = csv.writer(csvfile)
+                # Write header
+                writer.writerow(['frame_index', 'human_index', 'img_x', 'img_y', 'world_X', 'world_Y', 'world_Z'])
+                for (frame_index, human_index), img_point in sorted(player_image_points.items()):
+                    x_img, y_img = img_point
+
+                    # Backproject the image point to the court plane z=0
+                    world_point = backproject_to_plane(img_point, camera_matrix, dist_coeffs, R, t, plane_z=0)
+                    X_world, Y_world, Z_world = world_point
+
+                    writer.writerow([frame_index, human_index, x_img, y_img, X_world, Y_world, Z_world])
+
+            logging.info(f'Player positions saved to {output_csv_path}')
 
             # Organize results by frame
             frames = {}
@@ -369,7 +494,6 @@ def main():
                     frame_data = frames.get(frame_index, {})
 
                     # Plot player positions
-                    # Plot player positions
                     for human_index in sorted(frame_data.keys()):
                         img_point = frame_data[human_index]
 
@@ -392,9 +516,6 @@ def main():
                             # Plot the player's position on the court image
                             cv2.circle(court_image, (pixel_x, pixel_y), 5, color, -1)
 
-                            # Remove text labels
-                            # cv2.putText(court_image, f'P{human_index + 1}', (pixel_x + 5, pixel_y - 5),
-                            #             cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
                         else:
                             logging.warning(f"Player {human_index} position out of court bounds at frame {frame_index}")
 
