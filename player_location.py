@@ -482,6 +482,7 @@ def main():
             with VideoWriterContext(output_video_path, fourcc, fps, (output_width, output_height)) as output_video:
                 # Generate frames and write to video
                 cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # Reset to the first frame
+                # Inside the frame processing loop in main()
                 for frame_index in tqdm(range(frame_count), desc='Processing frames'):
                     ret, original_frame = cap.read()
                     if not ret:
@@ -508,10 +509,7 @@ def main():
                         # Ensure pixel coordinates are within court image boundaries
                         if 0 <= pixel_x < court_width_px and 0 <= pixel_y < court_height_px:
                             # Determine if the player is on the bottom or upper half
-                            if Y_world < 6.7:
-                                color = (0, 0, 255)  # Red for bottom half
-                            else:
-                                color = (0, 255, 0)  # Green for upper half
+                            color = (0, 0, 255) if Y_world < 6.7 else (0, 255, 0)
 
                             # Plot the player's position on the court image
                             cv2.circle(court_image, (pixel_x, pixel_y), 5, color, -1)
@@ -531,6 +529,10 @@ def main():
 
                     # Place the court image on the right
                     combined_frame[:court_image.shape[0], original_frame.shape[1]:] = court_image
+
+                    # Label the frame number in the top-left corner
+                    frame_label_position = (10, 30)  # Adjust the position as needed
+                    cv2.putText(combined_frame, f"Frame: {frame_index}", frame_label_position, cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
 
                     # Write the combined frame to the video
                     output_video.write(combined_frame)
