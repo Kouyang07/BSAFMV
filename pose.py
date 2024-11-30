@@ -9,7 +9,7 @@ from tqdm import tqdm
 from ultralytics import YOLO
 
 
-def load_court_coordinates(court_file):
+def load_court_coordinates(court_file, expansion_factor=1.15):
     logging.info(f"Reading court coordinates from {court_file}")
     coordinates = {}
     with open(court_file, 'r') as file:
@@ -17,7 +17,24 @@ def load_court_coordinates(court_file):
         for row in csv_reader:
             coordinates[row['Point']] = (float(row['X']), float(row['Y']))
     logging.info(f"Court coordinates: {coordinates}")
-    return coordinates
+
+    # Compute the midpoint
+    xs = [x for x, y in coordinates.values()]
+    ys = [y for x, y in coordinates.values()]
+    midpoint = (sum(xs) / len(xs), sum(ys) / len(ys))
+    logging.info(f"Midpoint of the court: {midpoint}")
+
+    # Expand each point by the specified expansion factor from the midpoint
+    expanded_coordinates = {}
+    for point_name, (x, y) in coordinates.items():
+        vector_x = x - midpoint[0]
+        vector_y = y - midpoint[1]
+        expanded_x = midpoint[0] + vector_x * expansion_factor
+        expanded_y = midpoint[1] + vector_y * expansion_factor
+        expanded_coordinates[point_name] = (expanded_x, expanded_y)
+    logging.info(f"Expanded court coordinates: {expanded_coordinates}")
+
+    return expanded_coordinates
 
 
 class PoseDetect:
