@@ -74,7 +74,7 @@ def detect_strong_minima(cleaned_df, N=5, base_prominence_threshold=None, promin
 
 def plot_results(cleaned_df, minima_df, ground_truth_frames, pid, N=5):
     if minima_df.empty:
-        print(f"No strong minima detected for Person {pid}.")
+        print(f"No strong minima detected for tracked_id {pid}.")
         return
     plt.figure(figsize=(12, 7))
     plt.plot(cleaned_df['frame_index'], cleaned_df['world_Y'], label='Cleaned world_Y', alpha=0.5)
@@ -95,7 +95,7 @@ def plot_results(cleaned_df, minima_df, ground_truth_frames, pid, N=5):
                      (x, y), textcoords="offset points", xytext=(0, -60), ha='center', color='green')
     plt.xlabel('Frame Index')
     plt.ylabel('world_Y')
-    plt.title(f'Person {pid}: Detected Strong Minima Based on Adaptive Prominence Threshold')
+    plt.title(f'tracked_id {pid}: Detected Strong Minima Based on Adaptive Prominence Threshold')
     plt.legend()
     plt.grid(True)
     plt.show()
@@ -104,21 +104,21 @@ def main(csv_file, show_graph=False, player_id=None):
     df = pd.read_csv(csv_file)
     df.columns = df.columns.str.strip()
     df['frame_index'] = df['frame_index'].astype(int)
-    df['human_index'] = df['human_index'].astype(int)
+    df['tracked_id'] = df['tracked_id'].astype(int)
     ground_truth_frames = [200, 294, 320, 365, 467]
 
-    # Get frame counts for each player and sort by frame count
-    frame_counts = df.groupby('human_index')['frame_index'].nunique().sort_values(ascending=False)
+    # Get frame counts for each tracked_id and sort by frame count
+    frame_counts = df.groupby('tracked_id')['frame_index'].nunique().sort_values(ascending=False)
     top_players = frame_counts.index[:2]
 
-    # Use provided player_id if specified, otherwise use the top two players
+    # Use provided player_id if specified, otherwise use the top two tracked_ids
     person_ids = [player_id] if player_id is not None else top_players
 
     for pid in person_ids:
-        person_df = df[df['human_index'] == pid].copy()
+        person_df = df[df['tracked_id'] == pid].copy()
         person_df.sort_values('frame_index', inplace=True)
         num_person_frames = person_df['frame_index'].nunique()
-        print(f"\nProcessing Person {pid} with {num_person_frames} frames.")
+        print(f"\nProcessing tracked_id {pid} with {num_person_frames} frames.")
         cleaned_df = remove_outliers(person_df, ground_truth_frames, k=1.5)
         cleaned_df = smooth_data(cleaned_df, window_length=25, polyorder=2)
         data_range = cleaned_df['world_Y_smooth'].max() - cleaned_df['world_Y_smooth'].min()
@@ -135,13 +135,13 @@ def main(csv_file, show_graph=False, player_id=None):
         )
         if show_graph:
             plot_results(cleaned_df, minima_df, ground_truth_frames, pid, N)
-        print(f"\nDetected Strong Minima for Person {pid}:")
+        print(f"\nDetected Strong Minima for tracked_id {pid}:")
         print(minima_df)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Process and detect minima in world_Y data.")
     parser.add_argument("csv_file", help="Path to the input CSV file.")
     parser.add_argument("--show_graph", action="store_true", help="Whether to show graphs.")
-    parser.add_argument("--player_id", type=int, help="Specify the player ID to process. Process top 2 players if not specified.")
+    parser.add_argument("--player_id", type=int, help="Specify the player ID to process. Process top 2 tracked_ids if not specified.")
     args = parser.parse_args()
     main(args.csv_file, show_graph=args.show_graph, player_id=args.player_id)

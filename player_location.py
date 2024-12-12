@@ -9,41 +9,31 @@ import csv
 from tqdm import tqdm
 from scipy.optimize import linear_sum_assignment
 
-# Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+HIP_HEIGHT = 1.0  # in meters, approximate average hip height
 
 def define_world_points():
     """
-    Defines the 3D world points of the badminton court (court landmarks).
-    Returns:
-        np.ndarray: An array of world points in meters (X, Y, Z).
+    Defines 3D world points of the badminton court (the corner points).
     """
-    # World coordinates in meters (X, Y, Z)
     world_points = np.array([
-        [0, 0, 0],         # P1 (Bottom left corner)
-        [0, 13.4, 0],      # P2 (Top left corner)
-        [6.1, 13.4, 0],    # P3 (Top right corner)
-        [6.1, 0, 0],       # P4 (Bottom right corner)
+        [0, 0, 0],
+        [0, 13.4, 0],
+        [6.1, 13.4, 0],
+        [6.1, 0, 0]
     ], dtype=np.float32)
     return world_points
 
-
 def read_court_points(court_csv):
     """
-    Reads the 2D court image points from the CSV file.
-    Args:
-        court_csv (str): Path to the court landmarks CSV file.
-    Returns:
-        np.ndarray: An array of image points in pixels (X, Y).
+    Reads the 2D court image corner points from CSV.
     """
     try:
         df = pd.read_csv(court_csv)
-        # Ensure required columns are present
         if not {'Point', 'X', 'Y'}.issubset(df.columns):
-            logging.error(f"Required columns are missing in {court_csv}.")
+            logging.error("Missing required columns in court CSV.")
             sys.exit(1)
-        # Use only the four corner points
         corner_points = df[df['Point'].isin(['P1', 'P2', 'P3', 'P4'])]
         image_points = corner_points[['X', 'Y']].values.astype(np.float32)
         return image_points
@@ -54,41 +44,26 @@ def read_court_points(court_csv):
         logging.error(f"File {court_csv} is empty.")
         sys.exit(1)
 
-
 def calibrate_camera(world_points, image_points, camera_matrix):
     """
-    Performs camera pose estimation to obtain extrinsic parameters.
-    Args:
-        world_points (np.ndarray): Array of world points.
-        image_points (np.ndarray): Array of corresponding image points.
-        camera_matrix (np.ndarray): The camera intrinsic matrix.
-    Returns:
-        tuple: rvec, tvec, dist_coeffs
+    Perform camera pose estimation (PnP).
     """
-    # Assume no lens distortion
-    dist_coeffs = np.zeros((4, 1))
-    # Solve the PnP problem to get rotation and translation vectors
-    ret, rvec, tvec = cv2.solvePnP(
-        world_points, image_points, camera_matrix, dist_coeffs)
+    dist_coeffs = np.zeros((4,1))
+    ret, rvec, tvec = cv2.solvePnP(world_points, image_points, camera_matrix, dist_coeffs)
     if not ret:
         logging.error("Camera pose estimation failed.")
         sys.exit(1)
     return rvec, tvec, dist_coeffs
 
-
 def read_pose_data(pose_csv):
     """
-    Reads the pose estimation data from the CSV file.
-    Args:
-        pose_csv (str): Path to the pose estimation CSV file.
-    Returns:
-        pd.DataFrame: Pose data DataFrame.
+    Reads the pose estimation CSV containing frame_index, human_index, joint_index, x, y, confidence.
     """
     try:
         df = pd.read_csv(pose_csv)
-        required_columns = {'frame_index', 'human_index', 'joint_index', 'x', 'y', 'confidence'}
-        if not required_columns.issubset(df.columns):
-            logging.error(f"Required columns are missing in {pose_csv}.")
+        required_cols = {'frame_index', 'human_index', 'joint_index', 'x', 'y', 'confidence'}
+        if not required_cols.issubset(df.columns):
+            logging.error("Missing required columns in pose CSV.")
             sys.exit(1)
         return df
     except FileNotFoundError:
@@ -98,436 +73,452 @@ def read_pose_data(pose_csv):
         logging.error(f"File {pose_csv} is empty.")
         sys.exit(1)
 
-
-def compute_player_locations(df, min_confidence_threshold=0.5):
+def backproject_to_plane(image_point, camera_matrix, dist_coeffs, R, t, plane_height=0.0):
     """
-    Computes player positions based on ankles and hips.
-    Args:
-        df (pd.DataFrame): Pose data DataFrame.
-        min_confidence_threshold (float): Minimum confidence to consider limbs visible.
-    Returns:
-        dict: A dictionary with frame_index as keys and lists of player data.
+    Backproject an image point onto a horizontal plane at a given height.
+    Returns None if projection is invalid.
+    """
+    undist_pt = cv2.undistortPoints(np.array([[image_point]], dtype=np.float32),
+                                    camera_matrix, dist_coeffs, P=None)
+    x, y = undist_pt[0,0]
+    point_cam = np.array([x, y, 1.0])
+
+    # Get camera position and ray direction in world coordinates
+    camera_pos = -R.T @ t
+    ray_dir = R.T @ point_cam
+    ray_dir = ray_dir / np.linalg.norm(ray_dir)
+
+    # Check if ray is parallel to plane
+    if abs(ray_dir[2]) < 1e-9:
+        return None
+
+    # Calculate intersection with plane
+    t = (plane_height - camera_pos[2]) / ray_dir[2]
+    if t < 0:  # Check if intersection is behind camera
+        return None
+
+    world_point = camera_pos + t * ray_dir
+    return world_point
+
+def project_hip_to_ground(hip_point, camera_matrix, dist_coeffs, R, t):
+    """
+    Projects hip point to ground plane using geometric relationship.
+    Returns the ground position accounting for perspective projection.
+    """
+    # Get camera position in world coordinates
+    camera_pos = -R.T @ t
+
+    # Project hip point to hip-height plane first
+    hip_plane = backproject_to_plane(hip_point, camera_matrix, dist_coeffs, R, t,
+                                     plane_height=HIP_HEIGHT)
+
+    if hip_plane is None:
+        return None
+
+    # Vector from camera to hip point
+    cam_to_hip = hip_plane - camera_pos
+
+    # Calculate the scaling factor to project to ground
+    # Using similar triangles relationship
+    scale = -camera_pos[2] / (hip_plane[2] - camera_pos[2])
+
+    # Project to ground using the scaling factor
+    ground_point = camera_pos + scale * cam_to_hip
+    ground_point[2] = 0  # Ensure point is exactly on ground plane
+
+    return ground_point
+
+def compute_player_locations(df, min_confidence=0.5):
+    """
+    Extracts hip and ankle information from the pose dataframe.
     """
     results = {}
     df = df.sort_values(by='frame_index')
     grouped = df.groupby(['frame_index', 'human_index'])
-    for (frame_index, human_index), joints in grouped:
-        if frame_index not in results:
-            results[frame_index] = []
-        player_data = {'human_index': human_index, 'joints': {}}
-        for joint_name, joint_indices in [('ankle', [15, 16]), ('hip', [11, 12])]:
-            joint_joints = joints[joints['joint_index'].isin(joint_indices)]
-            high_confidence = joint_joints[joint_joints['confidence'] > min_confidence_threshold]
-            if len(high_confidence) >= 1:
-                x = high_confidence['x'].mean()
-                y = high_confidence['y'].mean()
-                player_data['joints'][joint_name] = np.array([x, y], dtype=np.float32)
+
+    for (frame_idx, human_idx), joints in grouped:
+        if frame_idx not in results:
+            results[frame_idx] = []
+        player_data = {'human_index': human_idx, 'joints': {}}
+
+        # Left ankle (joint 15) and right ankle (joint 16)
+        left_ankle = joints[(joints['joint_index'] == 15) & (joints['confidence'] > min_confidence)]
+        right_ankle = joints[(joints['joint_index'] == 16) & (joints['confidence'] > min_confidence)]
+
+        if not left_ankle.empty:
+            player_data['joints']['left_ankle'] = np.array([left_ankle['x'].mean(), left_ankle['y'].mean()], dtype=np.float32)
+        if not right_ankle.empty:
+            player_data['joints']['right_ankle'] = np.array([right_ankle['x'].mean(), right_ankle['y'].mean()], dtype=np.float32)
+
+        # Ankle midpoint
+        if 'left_ankle' in player_data['joints'] and 'right_ankle' in player_data['joints']:
+            la = player_data['joints']['left_ankle']
+            ra = player_data['joints']['right_ankle']
+            player_data['joints']['ankle_midpoint'] = (la + ra) / 2.0
+        elif 'left_ankle' in player_data['joints']:
+            player_data['joints']['ankle_midpoint'] = player_data['joints']['left_ankle']
+        elif 'right_ankle' in player_data['joints']:
+            player_data['joints']['ankle_midpoint'] = player_data['joints']['right_ankle']
+
+        # Hip (average of joints 11 and 12)
+        hip_joints = joints[(joints['joint_index'].isin([11, 12])) & (joints['confidence'] > min_confidence)]
+        if not hip_joints.empty:
+            hx = hip_joints['x'].mean()
+            hy = hip_joints['y'].mean()
+            player_data['joints']['hip'] = np.array([hx, hy], dtype=np.float32)
+
         if player_data['joints']:
-            results[frame_index].append(player_data)
+            results[frame_idx].append(player_data)
+
     return results
-
-
-def backproject_to_ground(image_point, camera_matrix, dist_coeffs, R, t):
-    """
-    Backprojects an image point onto the ground plane (Z=0).
-    Args:
-        image_point (np.ndarray): The image point (u, v).
-        camera_matrix (np.ndarray): The camera matrix.
-        dist_coeffs (np.ndarray): The distortion coefficients.
-        R (np.ndarray): The rotation matrix.
-        t (np.ndarray): The translation vector.
-    Returns:
-        np.ndarray or None: The world point (X, Y, Z=0) on the ground plane, or None if cannot compute.
-    """
-    # Undistort the image point
-    undistorted_point = cv2.undistortPoints(
-        np.array([[image_point]], dtype=np.float32), camera_matrix, dist_coeffs, P=None)
-
-    x = undistorted_point[0, 0, 0]
-    y = undistorted_point[0, 0, 1]
-
-    point_cam = np.array([x, y, 1.0])
-    origin_world = -R.T @ t
-    direction_world = R.T @ point_cam
-
-    if abs(direction_world[2]) < 1e-6:
-        return None
-
-    s = -origin_world[2] / direction_world[2]
-    world_point = origin_world + s * direction_world
-
-    return world_point
-
 
 def track_players(frames_data):
     """
-    Tracks players across frames, ensuring only two players are considered.
-    Args:
-        frames_data (dict): Dictionary containing player data for each frame.
+    Simple tracking to maintain consistent player IDs across frames.
     """
-    previous_positions = None  # Stores positions from the previous frame
-
-    for frame_index in sorted(frames_data.keys()):
-        current_players = frames_data[frame_index]
+    previous_positions = None
+    for frame_idx in sorted(frames_data.keys()):
+        current_players = frames_data[frame_idx]
         detections = []
         for player_data in current_players:
-            world_pos = player_data.get('world_position')
-            if world_pos is not None:
-                detections.append((player_data, world_pos[:2]))
+            if 'world_position' in player_data and player_data['world_position'] is not None:
+                detections.append((player_data, player_data['world_position'][:2]))
 
         if previous_positions is None:
-            # Initialize tracked IDs
-            for idx, (player_data, _) in enumerate(detections[:2]):  # Only consider first two detections
-                player_data['tracked_id'] = idx
-            previous_positions = {player_data['tracked_id']: pos for player_data, pos in detections[:2]}
+            # Assign IDs to first two detections
+            for i, (pdata, _) in enumerate(detections[:2]):
+                pdata['tracked_id'] = i
+            previous_positions = {pdata['tracked_id']: pos for pdata, pos in detections[:2]}
         else:
-            # Match detections to previous positions
             prev_ids = list(previous_positions.keys())
             prev_positions = np.array(list(previous_positions.values()))
             curr_positions = np.array([pos for _, pos in detections])
 
-            # Compute cost matrix
-            cost_matrix = np.linalg.norm(prev_positions[:, np.newaxis] - curr_positions, axis=2)
-            row_ind, col_ind = linear_sum_assignment(cost_matrix)
+            if len(prev_positions) > 0 and len(curr_positions) > 0:
+                cost_matrix = np.linalg.norm(prev_positions[:, None] - curr_positions, axis=2)
+                row_ind, col_ind = linear_sum_assignment(cost_matrix)
 
-            assigned = set()
-            for r, c in zip(row_ind, col_ind):
-                if r < len(prev_ids) and c < len(detections):
-                    tracked_id = prev_ids[r]
-                    player_data, pos = detections[c]
-                    player_data['tracked_id'] = tracked_id
-                    previous_positions[tracked_id] = pos
-                    assigned.add(c)
+                assigned = set()
+                for r, c in zip(row_ind, col_ind):
+                    if r < len(prev_ids) and c < len(detections):
+                        tid = prev_ids[r]
+                        pdata, pos = detections[c]
+                        pdata['tracked_id'] = tid
+                        previous_positions[tid] = pos
+                        assigned.add(c)
 
-            # Handle unassigned detections (new or extra poses)
-            unassigned_detections = [i for i in range(len(detections)) if i not in assigned]
-            for i in unassigned_detections:
-                if len(previous_positions) < 2:
-                    # Assign new tracked ID
-                    tracked_id = max(previous_positions.keys()) + 1
-                    player_data, pos = detections[i]
-                    player_data['tracked_id'] = tracked_id
-                    previous_positions[tracked_id] = pos
-                else:
-                    # Extra detection, ignore
-                    continue
-
-            # Remove missing players
-            previous_positions = {player_data['tracked_id']: pos for player_data, pos in detections if 'tracked_id' in player_data}
-
+                unassigned = [i for i in range(len(detections)) if i not in assigned]
+                for i in unassigned:
+                    if len(previous_positions) < 2:
+                        new_id = 0 if not previous_positions else max(previous_positions.keys())+1
+                        pdata, pos = detections[i]
+                        pdata['tracked_id'] = new_id
+                        previous_positions[new_id] = pos
+                    # else ignore
+                previous_positions = {pdata['tracked_id']: pos for pdata, pos in detections if 'tracked_id' in pdata}
 
 class KalmanFilter:
     """
-    A simple Kalman Filter for tracking position and velocity in 2D.
+    Simple Kalman filter for smoothing player positions.
     """
-
     def __init__(self, dt=1.0, process_noise_std=1.0, measurement_noise_std=1.0):
-        """
-        Initializes the Kalman Filter.
-        Args:
-            dt (float): Time interval between measurements.
-            process_noise_std (float): Standard deviation of the process noise.
-            measurement_noise_std (float): Standard deviation of the measurement noise.
-        """
-        # Time interval
         self.dt = dt
-
-        # State vector: [x_position, y_position, x_velocity, y_velocity]
-        self.x = np.zeros((4, 1))
-
-        # State transition matrix
-        self.A = np.array([[1, 0, self.dt, 0],
-                           [0, 1, 0, self.dt],
-                           [0, 0, 1, 0],
-                           [0, 0, 0, 1]])
-
-        # Control matrix
-        self.B = np.zeros((4, 1))
-
-        # Measurement matrix
-        self.H = np.array([[1, 0, 0, 0],
-                           [0, 1, 0, 0]])
-
-        # Process noise covariance
-        q = process_noise_std ** 2
-        self.Q = q * np.eye(4)
-
-        # Measurement noise covariance
-        r = measurement_noise_std ** 2
-        self.R = r * np.eye(2)
-
-        # Initial covariance matrix
+        self.x = np.zeros((4,1))
+        self.A = np.array([[1,0,self.dt,0],
+                           [0,1,0,self.dt],
+                           [0,0,1,0],
+                           [0,0,0,1]])
+        self.H = np.array([[1,0,0,0],
+                           [0,1,0,0]])
+        q = process_noise_std**2
+        self.Q = q*np.eye(4)
+        r = measurement_noise_std**2
+        self.R = r*np.eye(2)
         self.P = np.eye(4)
 
     def predict(self):
-        """
-        Predicts the next state and updates the covariance matrix.
-        """
-        self.x = self.A @ self.x
-        self.P = self.A @ self.P @ self.A.T + self.Q
+        self.x = self.A@self.x
+        self.P = self.A@self.P@self.A.T + self.Q
 
     def update(self, z):
-        """
-        Updates the state vector with a new measurement.
-        Args:
-            z (np.ndarray): The measurement vector [x_position, y_position].
-        """
-        z = z.reshape(2, 1)
-        y = z - self.H @ self.x  # Measurement residual
-        S = self.H @ self.P @ self.H.T + self.R  # Residual covariance
-        K = self.P @ self.H.T @ np.linalg.inv(S)  # Kalman gain
-
-        self.x = self.x + K @ y
-        I = np.eye(self.P.shape[0])
-        self.P = (I - K @ self.H) @ self.P
-
+        z = z.reshape(2,1)
+        y = z - self.H@self.x
+        S = self.H@self.P@self.H.T + self.R
+        K = self.P@self.H.T@np.linalg.inv(S)
+        self.x = self.x + K@y
+        I = np.eye(4)
+        self.P = (I - K@self.H)@self.P
 
 def apply_kalman_filter(frames_data):
-    """
-    Applies Kalman filter to the player positions to reduce jitter.
-    Args:
-        frames_data (dict): Dictionary containing player data for each frame.
-    """
-    # Initialize Kalman filters for each player
     kalman_filters = {}
-
-    for frame_index in sorted(frames_data.keys()):
-        players = frames_data[frame_index]
-        for player_data in players:
-            if 'tracked_id' in player_data and 'world_position' in player_data:
-                tracked_id = player_data['tracked_id']
-                measurement = player_data['world_position'][:2]  # X_world, Y_world
-
-                if tracked_id not in kalman_filters:
-                    # Initialize a new Kalman filter for this player
-                    kf = KalmanFilter(dt=1.0, process_noise_std=1.0, measurement_noise_std=1.0)
-                    kf.x[:2] = measurement.reshape(2, 1)  # Initialize position
-                    kalman_filters[tracked_id] = kf
+    for frame_idx in sorted(frames_data.keys()):
+        players = frames_data[frame_idx]
+        for pdata in players:
+            if 'tracked_id' in pdata and pdata.get('world_position') is not None:
+                tid = pdata['tracked_id']
+                meas = pdata['world_position'][:2]
+                if tid not in kalman_filters:
+                    kf = KalmanFilter()
+                    kf.x[:2] = meas.reshape(2,1)
+                    kalman_filters[tid] = kf
                 else:
-                    kf = kalman_filters[tracked_id]
-
-                # Predict the next state
+                    kf = kalman_filters[tid]
                 kf.predict()
-
-                # Update with the current measurement
-                kf.update(measurement)
-
-                # Update the player data with the filtered position
-                filtered_position = kf.x[:2].flatten()
-                player_data['world_position'][:2] = filtered_position
-
+                kf.update(meas)
+                pdata['world_position'][:2] = kf.x[:2].flatten()
 
 def draw_court(court_image, court_scale):
-    """
-    Draws the badminton court on the court image.
-    """
     court_length_m = 13.4
     court_width_m = 6.1
     margin_m = 2.0
-    length_with_margin = court_length_m + 2 * margin_m
-    width_with_margin = court_width_m + 2 * margin_m
-
-    left = int(margin_m * court_scale)
-    right = int((margin_m + court_width_m) * court_scale)
-    top = int(margin_m * court_scale)
-    bottom = int((margin_m + court_length_m) * court_scale)
-
-    # Draw outer boundaries
-    cv2.rectangle(court_image, (left, top), (right, bottom), (255, 255, 255), 2)
-
-    # Draw the net at half the length of the court
-    net_y = int((margin_m + court_length_m / 2) * court_scale)
-    cv2.line(court_image, (left, net_y), (right, net_y), (255, 255, 255), 2)
-
+    left = int(margin_m*court_scale)
+    right = int((margin_m+court_width_m)*court_scale)
+    top = int(margin_m*court_scale)
+    bottom = int((margin_m+court_length_m)*court_scale)
+    cv2.rectangle(court_image, (left, top), (right, bottom), (255,255,255), 2)
+    net_y = int((margin_m + court_length_m/2)*court_scale)
+    cv2.line(court_image, (left, net_y), (right, net_y), (255,255,255), 2)
 
 def main():
-    """
-    Main function to process, compute player positions, and visualize.
-    """
-    # Parse arguments
-    parser = argparse.ArgumentParser(description='Compute player positions on badminton court and visualize.')
-    parser.add_argument('video_path', type=str, help='Path to input video file.')
-    parser.add_argument('--output_video', type=str, help='Path to output video file.')
+    parser = argparse.ArgumentParser(description='Compute and visualize player positions using hip offset.')
+    parser.add_argument('video_path', type=str, help='Path to input video.')
+    parser.add_argument('--output_video', type=str, help='Path to output video.')
     args = parser.parse_args()
 
-    # Extract base name of the video file
-    video_base_name = os.path.basename(args.video_path)
-    video_name_without_ext = os.path.splitext(video_base_name)[0]
-
-    # Construct paths to pose CSV and court CSV files
-    pose_csv = os.path.join('result', f'{video_name_without_ext}_pose.csv')
-    court_csv = os.path.join('result', f'{video_name_without_ext}_court.csv')
-
-    # Set output video path
+    video_name = os.path.splitext(os.path.basename(args.video_path))[0]
+    pose_csv = os.path.join('result', f'{video_name}_pose.csv')
+    court_csv = os.path.join('result', f'{video_name}_court.csv')
     if args.output_video:
         output_video_path = args.output_video
     else:
-        output_video_path = f'result/{video_name_without_ext}_positions.mp4'
+        output_video_path = f'result/{video_name}_positions.mp4'
 
-    # Ensure the 'result' directory exists
     os.makedirs('result', exist_ok=True)
 
-    # Read court world points and image points
+    # Read court data
     world_points = define_world_points()
     image_points = read_court_points(court_csv)
 
-    if len(world_points) != len(image_points):
-        logging.error("The number of world points and image points must be equal for calibration.")
-        sys.exit(1)
-
-    # Open the video to get the image size and FPS
+    # Video properties
     cap = cv2.VideoCapture(args.video_path)
     if not cap.isOpened():
-        logging.error(f"Cannot open video file {args.video_path}")
+        logging.error("Cannot open video.")
         sys.exit(1)
     fps = cap.get(cv2.CAP_PROP_FPS)
-    original_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    original_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    # Assume approximate camera intrinsic parameters
-    focal_length = original_width  # Approximation
-    center = (original_width / 2, original_height / 2)
+    # Camera intrinsics approximation
+    focal_length = w
+    center = (w/2, h/2)
     camera_matrix = np.array([[focal_length, 0, center[0]],
                               [0, focal_length, center[1]],
                               [0, 0, 1]], dtype=np.float32)
-
-    # Perform camera pose estimation
     rvec, tvec, dist_coeffs = calibrate_camera(world_points, image_points, camera_matrix)
     R, _ = cv2.Rodrigues(rvec)
     t = tvec.reshape(3)
 
-    # Read pose data
+    # Pose data
     df_pose = read_pose_data(pose_csv)
     if df_pose.empty:
-        logging.error("Pose CSV file is empty or has no data.")
+        logging.error("Pose CSV is empty.")
         sys.exit(1)
 
-    # Compute player locations
     frames_data = compute_player_locations(df_pose)
 
-    # Process frames data to compute world coordinates
-    for frame_index, players in frames_data.items():
-        for player_data in players:
-            joints = player_data['joints']
-            # Backproject joints onto the ground plane
-            if 'ankle' in joints:
-                image_point = joints['ankle']
-            elif 'hip' in joints:
-                image_point = joints['hip']
-            else:
-                continue
+    # Compute world positions using ankle and hip with offset correction
+    for frame_idx, players in frames_data.items():
+        for pdata in players:
+            j = pdata['joints']
 
-            world_position = backproject_to_ground(
-                image_point, camera_matrix, dist_coeffs, R, t)
-            if world_position is not None:
-                player_data['world_position'] = world_position
+            # If we have ankles, backproject to ground for reference
+            if 'ankle_midpoint' in j:
+                ankle_ground = backproject_to_plane(j['ankle_midpoint'], camera_matrix, dist_coeffs, R, t, plane_height=0.0)
+                if ankle_ground is not None:
+                    pdata['ankle_world_position'] = ankle_ground
 
-    # Track players and filter extra poses
+            # If we have hip, backproject to hip height and ground
+            # In the main loop where positions are computed:
+            if 'hip' in j:
+                hip_point = j['hip']
+                ground_position = project_hip_to_ground(hip_point, camera_matrix, dist_coeffs, R, t)
+
+                if ground_position is not None:
+                    pdata['world_position'] = ground_position
+                elif 'ankle_midpoint' in j:
+                    # Fallback to ankle position if hip projection fails
+                    ankle_ground = backproject_to_plane(j['ankle_midpoint'], camera_matrix,
+                                                        dist_coeffs, R, t, plane_height=0.0)
+                    if ankle_ground is not None:
+                        pdata['world_position'] = ankle_ground
+
+
+
+            # Decide final world position
+            if 'hip_world_position_ground' in pdata:
+                pdata['world_position'] = pdata['hip_world_position_ground']
+            elif 'ankle_world_position' in pdata:
+                pdata['world_position'] = pdata['ankle_world_position']
+
+            # Also backproject ankles individually to ground if available:
+            if 'left_ankle' in j:
+                la_g = backproject_to_plane(j['left_ankle'], camera_matrix, dist_coeffs, R, t, 0.0)
+                if la_g is not None:
+                    pdata['left_ankle_world'] = la_g
+            if 'right_ankle' in j:
+                ra_g = backproject_to_plane(j['right_ankle'], camera_matrix, dist_coeffs, R, t, 0.0)
+                if ra_g is not None:
+                    pdata['right_ankle_world'] = ra_g
+            if 'left_ankle_world' in pdata and 'right_ankle_world' in pdata:
+                pdata['ankle_midpoint_world'] = (pdata['left_ankle_world'] + pdata['right_ankle_world']) / 2.0
+            elif 'left_ankle_world' in pdata:
+                pdata['ankle_midpoint_world'] = pdata['left_ankle_world']
+            elif 'right_ankle_world' in pdata:
+                pdata['ankle_midpoint_world'] = pdata['right_ankle_world']
+
+    # Track players
     track_players(frames_data)
 
-    # Apply Kalman filter to smooth player positions
+    # Apply Kalman filter
     apply_kalman_filter(frames_data)
 
-    # Save player positions to CSV
-    output_rows = []
-    for frame_index, players in frames_data.items():
-        for player_data in players:
-            if 'tracked_id' not in player_data:
-                continue
-            tracked_id = player_data['tracked_id']
-            world_position = player_data['world_position']
-            x_img, y_img = player_data['joints'].get('ankle', player_data['joints'].get('hip', (0, 0)))
-            X_world, Y_world, Z_world = world_position
-            output_rows.append([frame_index, tracked_id, x_img, y_img, X_world, Y_world, Z_world])
+    # Save to CSV
+    output_csv_path = os.path.join('result', f'{video_name}_positions.csv')
+    rows = []
+    for frame_idx, players in frames_data.items():
+        for pdata in players:
+            if 'tracked_id' in pdata:
+                tid = pdata['tracked_id']
+                if 'world_position' in pdata and pdata['world_position'] is not None:
+                    wp = pdata['world_position']
+                    # Use ankle_midpoint or hip for image coords
+                    if 'ankle_midpoint' in pdata['joints']:
+                        x_img, y_img = pdata['joints']['ankle_midpoint']
+                    elif 'hip' in pdata['joints']:
+                        x_img, y_img = pdata['joints']['hip']
+                    else:
+                        x_img, y_img = (None, None)
+                    rows.append([frame_idx, tid, x_img, y_img, wp[0], wp[1], wp[2]])
 
-    output_csv_path = os.path.join('result', f'{video_name_without_ext}_positions.csv')
-    with open(output_csv_path, 'w', newline='') as csvfile:
-        writer = csv.writer(csvfile)
-        # Write header
-        writer.writerow(['frame_index', 'tracked_id', 'img_x', 'img_y', 'world_X', 'world_Y', 'world_Z'])
-        writer.writerows(output_rows)
+    with open(output_csv_path, 'w', newline='') as csvf:
+        writer = csv.writer(csvf)
+        writer.writerow(['frame_index','tracked_id','img_x','img_y','world_X','world_Y','world_Z'])
+        writer.writerows(rows)
 
-    logging.info(f'Player positions saved to {output_csv_path}')
+    logging.info(f"Player positions saved to {output_csv_path}")
 
     # Visualization
-    # Define court dimensions
     court_length_m = 13.4
     court_width_m = 6.1
     margin_m = 2.0
-    court_scale = 50  # pixels per meter
+    court_scale = 50
+    court_img_h = int((court_length_m + 2*margin_m)*court_scale)
+    court_img_w = int((court_width_m + 2*margin_m)*court_scale)
+    court_img_template = np.zeros((court_img_h, court_img_w, 3), dtype=np.uint8)
+    draw_court(court_img_template, court_scale)
 
-    court_img_height = int((court_length_m + 2 * margin_m) * court_scale)
-    court_img_width = int((court_width_m + 2 * margin_m) * court_scale)
-    court_image_template = np.zeros((court_img_height, court_img_width, 3), dtype=np.uint8)
-    draw_court(court_image_template, court_scale)
-
-    # Create a VideoWriter object
-    output_width = original_width + court_img_width
-    output_height = max(original_height, court_img_height)
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Codec
-    output_video = cv2.VideoWriter(output_video_path, fourcc, fps, (output_width, output_height))
+    out_w = w + court_img_w
+    out_h = max(h, court_img_h)
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    output_video = cv2.VideoWriter(output_video_path, fourcc, fps, (out_w, out_h))
 
     if not output_video.isOpened():
-        logging.error(f"Cannot open video writer with filename {output_video_path}")
+        logging.error(f"Cannot open video writer {output_video_path}")
         sys.exit(1)
 
-    # Assign colors to tracked IDs
-    colors = [(0, 255, 0), (0, 0, 255)]  # Green and Red for two players
-    tracked_id_to_color = {i: colors[i % 2] for i in range(2)}
+    colors = [(0,255,0), (0,0,255)]
+    tracked_id_to_color = {i: colors[i%2] for i in range(2)}
 
-    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # Reset to the first frame
-    for frame_index in tqdm(range(frame_count), desc='Processing frames'):
+    def world_to_court(X, Y):
+        px = int((X+margin_m)*court_scale)
+        py = int((court_length_m+margin_m - Y)*court_scale)
+        return (px, py)
+
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    for f_idx in tqdm(range(frame_count), desc='Processing frames'):
         ret, frame = cap.read()
         if not ret:
             break
+        court_img = court_img_template.copy()
+        frame_data = frames_data.get(f_idx, [])
 
-        # Create a copy of the court image
-        court_image = court_image_template.copy()
-
-        # Get frame data
-        frame_data = frames_data.get(frame_index, [])
-
-        # Plot player positions
-        for player_data in frame_data:
-            if 'tracked_id' not in player_data:
+        for pdata in frame_data:
+            if 'tracked_id' not in pdata:
                 continue
-            tracked_id = player_data['tracked_id']
-            color = tracked_id_to_color.get(tracked_id, (255, 255, 255))  # Default to white if not found
-            world_position = player_data.get('world_position')
-            if world_position is None:
-                continue
+            tid = pdata['tracked_id']
+            c = tracked_id_to_color.get(tid, (255,255,255))
 
-            X_world, Y_world = world_position[0], world_position[1]
+            # Draw player position on overhead court
+            if 'world_position' in pdata and pdata['world_position'] is not None:
+                wp = pdata['world_position']
+                wp_px = world_to_court(wp[0], wp[1])
+                cv2.circle(court_img, wp_px, 5, c, -1)
+                cv2.putText(court_img, f"P{tid}", (wp_px[0]-15, wp_px[1]-15), cv2.FONT_HERSHEY_SIMPLEX, 0.6, c, 2)
 
-            # Convert from court coordinates (meters) to pixel coordinates on the court image
-            pixel_x = int((X_world + margin_m) * court_scale)
-            pixel_y = int((court_length_m + margin_m - Y_world) * court_scale)  # Adjust Y to invert
+            # Draw hip height and ground
+            if 'hip_world_position_hip_plane' in pdata:
+                hh = pdata['hip_world_position_hip_plane']
+                hh_px = world_to_court(hh[0], hh[1])
+                cv2.circle(court_img, hh_px, 5, (255,0,0), -1)
+                cv2.putText(court_img, "HipH", (hh_px[0]+5, hh_px[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,0,0), 1)
+            if 'hip_world_position_ground' in pdata:
+                hg = pdata['hip_world_position_ground']
+                hg_px = world_to_court(hg[0], hg[1])
+                cv2.circle(court_img, hg_px, 5, (0,255,0), -1)
+                cv2.putText(court_img, "HipG", (hg_px[0]+5, hg_px[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 1)
 
-            # Plot the player's position on the court image
-            cv2.circle(court_image, (pixel_x, pixel_y), 5, color, -1)
-            # Optionally, draw the player ID
-            cv2.putText(court_image, f"P{tracked_id}", (pixel_x - 15, pixel_y - 15),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+            # Ankle points on overhead
+            if 'left_ankle_world' in pdata:
+                la = pdata['left_ankle_world']
+                la_px = world_to_court(la[0], la[1])
+                cv2.circle(court_img, la_px, 5, (0,255,255), -1)
+                cv2.putText(court_img, "LAnk", (la_px[0]+5, la_px[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,255), 1)
+            if 'right_ankle_world' in pdata:
+                ra = pdata['right_ankle_world']
+                ra_px = world_to_court(ra[0], ra[1])
+                cv2.circle(court_img, ra_px, 5, (255,255,0), -1)
+                cv2.putText(court_img, "RAnk", (ra_px[0]+5, ra_px[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,0), 1)
+            if 'ankle_midpoint_world' in pdata:
+                am = pdata['ankle_midpoint_world']
+                am_px = world_to_court(am[0], am[1])
+                cv2.circle(court_img, am_px, 5, (255,0,255), -1)
+                cv2.putText(court_img, "AnkM", (am_px[0]+5, am_px[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,0,255), 1)
 
-            # Draw a circle on the original frame at the ankle position
-            x_img, y_img = player_data['joints'].get('ankle', player_data['joints'].get('hip', (0, 0)))
-            cv2.circle(frame, (int(x_img), int(y_img)), 5, color, -1)
-            cv2.putText(frame, f"P{tracked_id}", (int(x_img) - 15, int(y_img) - 15),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+            # On original frame, draw joints as detected
+            j = pdata['joints']
+            # Draw hip height and ground
+            if 'hip_world_position_hip_plane' in pdata:
+                hh = pdata['hip_world_position_hip_plane']
+                hh_px = world_to_court(hh[0], hh[1])
+                cv2.circle(court_img, hh_px, 5, (255,0,0), -1)
+                cv2.putText(court_img, "HipH", (hh_px[0]+5, hh_px[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,0,0), 1)
+            if 'hip_world_position_ground' in pdata:
+                hg = pdata['hip_world_position_ground']
+                hg_px = world_to_court(hg[0], hg[1])
+                cv2.circle(court_img, hg_px, 5, (0,255,0), -1)
+                cv2.putText(court_img, "HipG", (hg_px[0]+5, hg_px[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 1)
+            if 'left_ankle' in j:
+                la_pt = j['left_ankle'].astype(int)
+                cv2.circle(frame, (la_pt[0], la_pt[1]), 5, (0,255,255), -1)
+                cv2.putText(frame, "LAnk", (la_pt[0]+5, la_pt[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,255), 1)
+            if 'right_ankle' in j:
+                ra_pt = j['right_ankle'].astype(int)
+                cv2.circle(frame, (ra_pt[0], ra_pt[1]), 5, (255,255,0), -1)
+                cv2.putText(frame, "RAnk", (ra_pt[0]+5, ra_pt[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,0), 1)
+            if 'ankle_midpoint' in j:
+                am_pt = j['ankle_midpoint'].astype(int)
+                cv2.circle(frame, (am_pt[0], am_pt[1]), 5, (255,0,255), -1)
+                cv2.putText(frame, "AnkM", (am_pt[0]+5, am_pt[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,0,255), 1)
 
-        # Combine original frame and court image
-        combined_frame = np.zeros((output_height, output_width, 3), dtype=np.uint8)
-        combined_frame[:original_height, :original_width] = frame
-        combined_frame[:court_image.shape[0], original_width:] = court_image
-
-        # Write the frame to the video
-        output_video.write(combined_frame)
+        combined = np.zeros((out_h, out_w, 3), dtype=np.uint8)
+        combined[:h, :w] = frame
+        combined[:court_img.shape[0], w:] = court_img
+        output_video.write(combined)
 
     output_video.release()
     cap.release()
-    logging.info(f'Visualization video created: {output_video_path}')
-
+    logging.info(f"Visualization saved to {output_video_path}")
 
 if __name__ == "__main__":
     main()
