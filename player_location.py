@@ -443,6 +443,10 @@ def main():
         court_img = court_img_template.copy()
         frame_data = frames_data.get(f_idx, [])
 
+        # Add frame number
+        frame_number_text = f"Frame: {f_idx}"
+        cv2.putText(frame, frame_number_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+
         for pdata in frame_data:
             if 'tracked_id' not in pdata:
                 continue
